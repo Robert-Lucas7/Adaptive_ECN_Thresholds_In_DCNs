@@ -53,6 +53,12 @@ public:
 	// for approximate calc in PINT
 	int logres_shift(int b, int l);
 	int log2apprx(int x, int b, int m, int l); // given x of at most b bits, use most significant m bits of x, calc the result in l bits
+
+	// ================================ My Changes - Robert Lucas =============================
+	uint64_t getTxBytes(uint32_t port) {
+		return m_txBytes[port];
+	}
+	// ========================================================================================
 };
 
 } /* namespace ns3 */
