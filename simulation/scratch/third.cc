@@ -109,6 +109,7 @@ uint32_t agent_inference_interval = 200000; // 200 microseconds inference interv
 
 struct Env
 {
+	uint64_t agentNum;
 	uint64_t BW;
 	double txRate;
 	double averageQLength;
@@ -131,7 +132,7 @@ class CommInterface : public Ns3AIRL<Env, Act> {
 		void setEnv(double BW, double txRate, double averageQLength,
 					 double txRateECN, double k_min_in, double k_max_in,
 					 double p_max_in);
-		vector<double> getAct(double BW, double txRate, double averageQLength,
+		vector<double> getAct(uint64_t agentNum, uint64_t BW, double txRate, double averageQLength,
 					 double txRateECN, double k_min_in, double k_max_in,
 					 double p_max_in);
 };
@@ -141,12 +142,14 @@ CommInterface::CommInterface(uint16_t id) : Ns3AIRL<Env, Act>(id)
 	SetCond(2, 0); // Sets the operation lock (even for ns-3 and odd for python)
 }
 
-vector<double> CommInterface::getAct(double BW, double txRate, double averageQLength,
+vector<double> CommInterface::getAct(uint64_t agentNum, uint64_t BW, double txRate, double averageQLength,
 					 double txRateECN, double k_min_in, double k_max_in,
 					 double p_max_in)
 {
+	std::cout << "TRYING TO COMMUNICATE WITH PYTHON" << std::endl;
 	auto env = EnvSetterCond();     ///< Acquire the Env memory for writing
-    env->BW = BW;
+    env->agentNum = agentNum;
+	env->BW = BW;
 	env->txRate = txRate;
 	env->averageQLength = averageQLength;
 	env->txRateECN = txRateECN;
@@ -155,12 +158,17 @@ vector<double> CommInterface::getAct(double BW, double txRate, double averageQLe
 	env->p_max_in = p_max_in;
     SetCompleted(); 
 
+	std::cout << "Sent observation, getting action" << std::endl;
+	
+
     auto act = ActionGetterCond();  ///< Acquire the Act memory for reading
     vector<double> ecnParameters;
 	ecnParameters.push_back(act->k_min_out);
 	ecnParameters.push_back(act->k_max_out);
 	ecnParameters.push_back(act->p_max_out);
-    GetCompleted();               
+    GetCompleted(); 
+	std::cout << "Got action: "<< ecnParameters[0] << " " << ecnParameters[1] << " " << ecnParameters[2] << std::endl;
+	             
     return ecnParameters;
 }
 
@@ -195,14 +203,14 @@ private:
 	double getAverageECNMarkedOutputRate();
 
 public:
-	Agent(uint16_t id, Ptr<SwitchNode> sw, int port);
+	Agent(CommInterface commInterface, Ptr<SwitchNode> sw, int port);
 	void setECNParameters();
 	void SetFinish();
 	std::string GetSwitchAndPortID();
 	int GetPort();
 };
 
-Agent::Agent(uint16_t id, Ptr<SwitchNode> sw, int port) : m_sw(sw), m_port(port), m_lastTx(sw->getTxBytes(port)), m_commInterface(id)
+Agent::Agent(CommInterface commInterface, Ptr<SwitchNode> sw, int port) : m_sw(sw), m_port(port), m_lastTx(sw->getTxBytes(port)), m_commInterface(commInterface)
 {
 	m_curKmin = sw->m_mmu->kmin[port];
 	m_curKmax = sw->m_mmu->kmax[port];
@@ -239,7 +247,8 @@ void Agent::setECNParameters(){
 		throw std::runtime_error("Cannot get bw - qbbDev is null");
 	}
 	double avgQLen = GetAverageQueueLength();
-	vector<double> ecnParameters = m_commInterface.getAct(bw, txRate, avgQLen,
+	// N.B. m_port is 1-indexed in this script, use 0-indexing in python so decrement this by 1 here.
+	vector<double> ecnParameters = m_commInterface.getAct(m_port - 1, bw, txRate, avgQLen,
 					 txRateECN, m_curKmin, m_curKmax, m_curPmax);
 
 	m_curKmin = static_cast<uint32_t>(ecnParameters[0]);
@@ -248,7 +257,7 @@ void Agent::setECNParameters(){
 	Time now = Simulator::Now();
 	// std::cout << GetSwitchAndPortID() << " " << ecnParameters[0] << " " << ecnParameters[1] << " " << ecnParameters[2] << std::endl;
 
-	// m_sw->m_mmu->ConfigEcn(m_port, ecnParameters[0], ecnParameters[1], ecnParameters[2]);
+	m_sw->m_mmu->ConfigEcn(m_port, ecnParameters[0], ecnParameters[1], ecnParameters[2]);
 }
 
 double Agent::getAverageECNMarkedOutputRate() {
@@ -1167,6 +1176,7 @@ int main(int argc, char *argv[])
 	// ============================= My Changes - Robert Lucas ==========================
 	vector<Agent*> portAgents;
 	uint16_t memblock_key = 2333;
+	CommInterface commInterface(2333);
 	// ==================================================================================
 
 	// config switch
@@ -1197,7 +1207,8 @@ int main(int argc, char *argv[])
 				// TODO: evaluate if this jitter should be used.
 				// Only initialise the RL agents if adaptive ECN marking should be used.
 				if(rl_ecn_marking == 1){
-					Agent *agent = new Agent(memblock_key++, sw, j);
+					std::cout << "PORT: "<< j << std::endl;
+					Agent *agent = new Agent(commInterface, sw, j);
 					portAgents.push_back(agent);
 					Time jitter = NanoSeconds(uv->GetInteger(0, 1000000));
 					Simulator::Schedule(jitter, &UpdateECNParameters, agent);
