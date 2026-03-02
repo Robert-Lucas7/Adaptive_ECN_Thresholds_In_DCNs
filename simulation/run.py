@@ -62,7 +62,7 @@ QLEN_MON_START 2000000000
 QLEN_MON_END 3000000000
 
 
-INSTANT_QLEN_MON_FILE mix/instant_qlen_{topo}_{trace}_{cc}{failure}.txt
+INSTANT_QLEN_MON_FILE mix/instant_qlen_{topo}_{trace}_{cc}{failure}_{rl_ecn_marking}.txt
 RL_ECN_MARKING {rl_ecn_marking}
 """
 if __name__ == "__main__":
@@ -175,4 +175,4 @@ if __name__ == "__main__":
 	with open(config_name, "w") as file:
 		file.write(config)
 	
-	os.system("./waf --run 'scratch/third %s'"%(config_name))
+	os.system("./waf --run 'scratch/third_in_sync %s'"%(config_name))

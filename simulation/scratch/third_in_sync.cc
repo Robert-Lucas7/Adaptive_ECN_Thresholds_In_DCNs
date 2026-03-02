@@ -107,9 +107,10 @@ uint64_t instant_qlen_mon_interval = 100;  // 20 microsecond interval - measure 
 
 uint32_t agent_inference_interval = 200000; // 200 microseconds inference interval
 
-struct Env
+#define NUM_AGENTS 5
+
+struct AgentEnv
 {
-	uint64_t agentNum;
 	uint64_t BW;
 	double txRate;
 	double averageQLength;
@@ -119,22 +120,26 @@ struct Env
 	double p_max_in;
 } Packed;
 
-struct Act
+struct Env {
+    AgentEnv agents[NUM_AGENTS];
+} Packed;
+
+struct AgentAct
 {
 	double k_min_out;
 	double k_max_out;
 	double p_max_out;
 } Packed;
 
+struct Act {
+    AgentAct agents[NUM_AGENTS];
+} Packed;
+
+
 class CommInterface : public Ns3AIRL<Env, Act> {
 	public:
 		CommInterface(uint16_t id);
-		void setEnv(double BW, double txRate, double averageQLength,
-					 double txRateECN, double k_min_in, double k_max_in,
-					 double p_max_in);
-		vector<double> getAct(uint64_t agentNum, uint64_t BW, double txRate, double averageQLength,
-					 double txRateECN, double k_min_in, double k_max_in,
-					 double p_max_in);
+		AgentAct* getAct(AgentEnv* agentEnvs);
 };
 
 CommInterface::CommInterface(uint16_t id) : Ns3AIRL<Env, Act>(id)
@@ -142,32 +147,22 @@ CommInterface::CommInterface(uint16_t id) : Ns3AIRL<Env, Act>(id)
 	SetCond(2, 0); // Sets the operation lock (even for ns-3 and odd for python)
 }
 
-vector<double> CommInterface::getAct(uint64_t agentNum, uint64_t BW, double txRate, double averageQLength,
-					 double txRateECN, double k_min_in, double k_max_in,
-					 double p_max_in)
+AgentAct* CommInterface::getAct(AgentEnv* agentEnvs)
 {
-	std::cout << "TRYING TO COMMUNICATE WITH PYTHON" << std::endl;
-	auto env = EnvSetterCond();     ///< Acquire the Env memory for writing
-    env->agentNum = agentNum;
-	env->BW = BW;
-	env->txRate = txRate;
-	env->averageQLength = averageQLength;
-	env->txRateECN = txRateECN;
-	env->k_min_in = k_min_in;
-	env->k_max_in = k_max_in;
-	env->p_max_in = p_max_in;
+	// std::cout << "TRYING TO COMMUNICATE WITH PYTHON" << std::endl;
+	auto env = EnvSetterCond();
+	for (int i = 0; i < NUM_AGENTS; i++) {
+		env->agents[i] = agentEnvs[i];
+	}     ///< Acquire the Env memory for writing
     SetCompleted(); 
 
-	std::cout << "Sent observation, getting action" << std::endl;
+	// std::cout << "Sent observation, getting action" << std::endl;
 	
 
     auto act = ActionGetterCond();  ///< Acquire the Act memory for reading
-    vector<double> ecnParameters;
-	ecnParameters.push_back(act->k_min_out);
-	ecnParameters.push_back(act->k_max_out);
-	ecnParameters.push_back(act->p_max_out);
+    AgentAct *ecnParameters = act->agents;
     GetCompleted(); 
-	std::cout << "Got action: "<< ecnParameters[0] << " " << ecnParameters[1] << " " << ecnParameters[2] << std::endl;
+	// std::cout << "Got action: "<< ecnParameters[0] << " " << ecnParameters[1] << " " << ecnParameters[2] << std::endl;
 	             
     return ecnParameters;
 }
@@ -179,7 +174,6 @@ private:
 	Ptr<SwitchNode> m_sw;
 	int m_port;
 	uint64_t m_lastTx;
-	CommInterface m_commInterface;
 	// N.B. In sw->m_mmu, these are the data types for k_min, k_max, p_max. TODO: Check if k_min and k_max can be fully continuous (i.e. double as well)
 	uint32_t m_curKmin, m_curKmax;
 	double m_curPmax;
@@ -201,16 +195,17 @@ private:
 	void UpdateArea();
 	double GetAverageQueueLength();
 	double getAverageECNMarkedOutputRate();
+	
 
 public:
-	Agent(CommInterface commInterface, Ptr<SwitchNode> sw, int port);
-	void setECNParameters();
-	void SetFinish();
+	Agent(Ptr<SwitchNode> sw, int port);
+	AgentEnv getState();
+	void setECNParameters(AgentAct agentAct);
 	std::string GetSwitchAndPortID();
 	int GetPort();
 };
 
-Agent::Agent(CommInterface commInterface, Ptr<SwitchNode> sw, int port) : m_sw(sw), m_port(port), m_lastTx(sw->getTxBytes(port)), m_commInterface(commInterface)
+Agent::Agent(Ptr<SwitchNode> sw, int port) : m_sw(sw), m_port(port), m_lastTx(sw->getTxBytes(port))
 {
 	m_curKmin = sw->m_mmu->kmin[port];
 	m_curKmax = sw->m_mmu->kmax[port];
@@ -218,7 +213,7 @@ Agent::Agent(CommInterface commInterface, Ptr<SwitchNode> sw, int port) : m_sw(s
 
 	Ptr<NetDevice> device = m_sw->GetDevice(m_port);
 	Ptr<QbbNetDevice> qbbDev = DynamicCast<QbbNetDevice>(device);
-
+	
 	if (qbbDev) {
 		m_bandWidth = qbbDev->GetDataRate().GetBitRate();
 		
@@ -226,6 +221,7 @@ Agent::Agent(CommInterface commInterface, Ptr<SwitchNode> sw, int port) : m_sw(s
 		qbbDev->TraceConnectWithoutContext("QbbDequeue", MakeCallback(&Agent::TraceDequeue, this));
 		qbbDev->TraceConnectWithoutContext("QbbDrop", MakeCallback(&Agent::TraceDrop, this));
 	}
+
 
 	m_lastQlenEventTime = Simulator::Now();
 	m_QlenWindowStartTime = Simulator::Now();
@@ -236,7 +232,8 @@ Agent::Agent(CommInterface commInterface, Ptr<SwitchNode> sw, int port) : m_sw(s
 	m_txRateECN = 0;
 }
 
-void Agent::setECNParameters(){
+AgentEnv Agent::getState(){
+	AgentEnv env;
 	double txRate = getAverageDataOutputRate();
 	double txRateECN = getAverageECNMarkedOutputRate();
 	Ptr<QbbNetDevice> qbbDev = DynamicCast<QbbNetDevice>(m_sw->GetDevice(m_port));
@@ -248,16 +245,29 @@ void Agent::setECNParameters(){
 	}
 	double avgQLen = GetAverageQueueLength();
 	// N.B. m_port is 1-indexed in this script, use 0-indexing in python so decrement this by 1 here.
-	vector<double> ecnParameters = m_commInterface.getAct(m_port - 1, bw, txRate, avgQLen,
-					 txRateECN, m_curKmin, m_curKmax, m_curPmax);
-
-	m_curKmin = static_cast<uint32_t>(ecnParameters[0]);
-	m_curKmax = static_cast<uint32_t>(ecnParameters[1]);
-	m_curPmax = ecnParameters[2];
-	Time now = Simulator::Now();
+	env.BW = bw;
+	env.txRate = txRate;
+	env.averageQLength = avgQLen;
+	env.txRateECN = txRateECN;
+	env.k_min_in = m_curKmin;
+	env.k_max_in = m_curKmax;
+	env.p_max_in = m_curPmax;
+	return env;
+	// m_curKmin = static_cast<uint32_t>(ecnParameters[0]);
+	// m_curKmax = static_cast<uint32_t>(ecnParameters[1]);
+	// m_curPmax = ecnParameters[2];
+	// Time now = Simulator::Now();
 	// std::cout << GetSwitchAndPortID() << " " << ecnParameters[0] << " " << ecnParameters[1] << " " << ecnParameters[2] << std::endl;
 
 	// m_sw->m_mmu->ConfigEcn(m_port, ecnParameters[0], ecnParameters[1], ecnParameters[2]);
+}
+
+void Agent::setECNParameters(AgentAct agentAct) {
+	m_curKmin = static_cast<uint32_t>(agentAct.k_min_out);
+	m_curKmax = static_cast<uint32_t>(agentAct.k_max_out);
+	m_curPmax = agentAct.p_max_out;
+
+	m_sw->m_mmu->ConfigEcn(m_port, m_curKmin, m_curKmax, m_curPmax);
 }
 
 double Agent::getAverageECNMarkedOutputRate() {
@@ -286,10 +296,6 @@ double Agent::getAverageDataOutputRate() {
 	return txRate;
 }
 
-void Agent::SetFinish() {
-	m_commInterface.SetFinish();
-}
-
 std::string Agent::GetSwitchAndPortID() {
 	return std::to_string(m_sw->m_mmu->node_id) + "-" + std::to_string(m_port);
 }
@@ -311,13 +317,14 @@ double Agent::GetAverageQueueLength() {
         avgQ = m_qArea / windowDurationNs;
     }
 
+	// std::cout << windowDurationNs << " " << m_qArea << " " << avgQ << std::endl;
+
     m_qArea = 0;
     m_QlenWindowStartTime = now;
 
 	return avgQ * 8;  // Average queue length in bits
 }
 
-// TODO: Fully understand this code.
 void Agent::TraceEnqueue(Ptr<const Packet> p, uint32_t priority) {
     UpdateArea();
     m_currentQlen += p->GetSize();
@@ -465,20 +472,21 @@ struct QlenDistribution{
 
 // =========================== My Changes - Robert Lucas ================
 // sw, j, &agent, agent_inference_interval);
-void UpdateECNParameters(Agent *agent) {
+void UpdateECNParameters(vector<Agent*> agents, CommInterface commInterface) {
 	uint64_t t = Simulator::Now().GetTimeStep();
 	
-	// Need to get the queue length here (and other state metrics)
-	// N.B. Can add arguments to 'GetAgentAction' by passing them as another argument to the Simulator::Schedule method.
-	// N.B. As this will schedule events recursively, we are relying on the Simulator::Stop() method.
+	AgentEnv combinedEnv[NUM_AGENTS];
+	for(int i=0;i < NUM_AGENTS; i++){
+		combinedEnv[i] = agents[i]->getState();
+	}
+	AgentAct* agentActs = commInterface.getAct(combinedEnv);
 
-	// Instantaneous Queue length can be found with sw->m_mmu->egress_bytes[port][priority]
-	
-	agent->setECNParameters();
-	// std::cout << agent->GetSwitchAndPortID() << " " << t << std::endl;
-	
+	for(int i=0;i<NUM_AGENTS;i++) {
+		agents[i]->setECNParameters(agentActs[i]);
+	}
 
-	Simulator::Schedule(NanoSeconds(agent_inference_interval), &UpdateECNParameters, agent);
+	// std::cout << "In C++ Control loop" << std::endl;
+	Simulator::Schedule(NanoSeconds(agent_inference_interval), &UpdateECNParameters, agents, commInterface);
 }
 
 uint64_t get_nic_rate(NodeContainer &n);
@@ -1208,10 +1216,8 @@ int main(int argc, char *argv[])
 				// Only initialise the RL agents if adaptive ECN marking should be used.
 				if(rl_ecn_marking == 1){
 					std::cout << "PORT: "<< j << std::endl;
-					Agent *agent = new Agent(commInterface, sw, j);
+					Agent *agent = new Agent(sw, j);
 					portAgents.push_back(agent);
-					Time jitter = NanoSeconds(uv->GetInteger(0, 1000000));
-					Simulator::Schedule(jitter, &UpdateECNParameters, agent);
 				}
 				// =====================================================================
 			}
@@ -1220,7 +1226,11 @@ int main(int argc, char *argv[])
 			sw->m_mmu->node_id = sw->GetId();
 		}
 	}
-
+	// ================= My Changes =================
+	if (rl_ecn_marking == 1) {
+		Simulator::Schedule(Seconds(2), &UpdateECNParameters, portAgents, commInterface);
+	}
+	// ==============================================
 	#if ENABLE_QP
 	FILE *fct_output = fopen(fct_output_file.c_str(), "w");
 	//
@@ -1397,8 +1407,8 @@ int main(int argc, char *argv[])
 	fclose(trace_output);
 
 	// ========================== My Changes - Robert Lucas =======================
-	for (Agent* a : portAgents) {
-		a->SetFinish(); // Send signal to python script (the RL agent to finish).
+	commInterface.SetFinish();
+	for (Agent* a : portAgents) { // Send signal to python script (the RL agent to finish).
 		delete a;
 	}
 	portAgents.clear();
