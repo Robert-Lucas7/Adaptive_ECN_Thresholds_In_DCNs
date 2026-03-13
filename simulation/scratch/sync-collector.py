@@ -25,6 +25,11 @@ from torchrl.collectors import SyncDataCollector
 from tqdm import tqdm
 import subprocess
 import os
+import json
+import signal
+import psutil
+import time
+import gc
 
 class OBS(Enum):
     BW = 0
@@ -39,10 +44,15 @@ NUM_ACTIONS = 3
 NUM_STATE_PARAMS = 7
 NUM_HIDDEN_CELLS = 64
 NUM_AGENTS = 5
-FRAMES_PER_BATCH = 1024
+# FRAMES_PER_BATCH = 1024
 TOTAL_FRAMES = 5_000_000
 SEQUENCE_LENGTH = 16
 TOTAL_BUFFER_SIZE = 1000  # TODO: REMOVE
+
+# N.B. NUM_DESIRED_SEQUENCES must be divisible by NUM_MINI_BATCHES.
+NUM_DESIRED_SEQUENCES = 64
+NUM_MINI_BATCHES = 4
+
 
 class SNNNetwork(nn.Module):
     # TODO: Add a batch dimension so that parallel training is possible.
@@ -125,7 +135,7 @@ class AgentAct(Structure):
     _pack_ = 1
     _fields_ = [
         ("k_min_out", c_double),
-        ("k_max_out", c_double),
+        ("k_delta_out", c_double),
         ("p_max_out", c_double)
     ]
 
@@ -175,16 +185,121 @@ class RLEnv(EnvBase):
         )
         self.last_obs = torch.zeros(*self.batch_size, NUM_STATE_PARAMS, dtype=torch.float32, device=self.device)
         self.python2_path = "/home/links/rl624/.conda/envs/hpcc_env/bin/python"
+        
+        self.pool_id = 1234
+        self.rl_id = 2333
+        # self.cur_sim_num = 0
         self.ns3_args = {
             "cc": "dcqcn",
             "bw": 100,
             "rl_ecn_marking": 1,
-            "trace": "web_search_5_80_2s",  # star_5_single_burst_trace  web_search_5_80_100s
-            "topo": "star_5"
+            "trace": "web_search_5_80_0.01s",  # star_5_single_burst_trace  web_search_5_80_100s
+            "topo": "star_5",
+            "sim_num": 0
         }
         self.sim_done = True # Flag to determine whether to start the ns3 simulation.
+
+        self.ns3_process = None
+
+        
+
+        # Very important scaling to prevent exploding gradients, producing 'nan' actions.
+        self.OBS_SCALE = torch.tensor([
+            1e11,   # BW
+            1e11,   # txRate
+            1e8,    # averageQLength
+            1e11,   # txRateECN
+            3000,   # k_min
+            6000,   # k_max
+            1.0     # p_max
+        ], dtype=torch.float32, device=self.device)
+
+        # ============ FOR Debugging ==============
+        self.w = 0.2
+        self.alpha = 20
+        self.reward_history = [{
+            "rewards": [],
+            "q_lengths": [],
+            "throughput": [],
+            "normalised_q_lengths": [],
+            "normalised_throughput": [],
+            "w": self.w,
+            "alpha": self.alpha,
+            "n": [],
+            "T": [],
+            "D": [],
+            "k_min": [],
+            "k_max": [],
+            "p_max": []
+        } for _ in range(NUM_AGENTS)]
     
+    def set_mode(self, mode):
+        print("in set_mode")
+        if mode.upper() == "EVAL":
+            print("SETTING TRACE")
+            self.ns3_args["trace"] = "web_search_5_80_0.1s"
+        else:
+            pass
+    
+    def save_reward_history(self):
+        with open(f"../reward_data_agent.txt", "w") as f:
+            json.dump(self.reward_history, f)
+
+
     def start_ns3_simulation(self):
+        """
+        Start a new ns3 simulation. The previous simulation will be stopped before the new one is started.
+        """
+        if self.ns3_process and self.ns3_process.poll() is None:
+                try:
+                    # TODO: document code
+                    parent = psutil.Process(self.ns3_process.pid)
+                    children = parent.children(recursive=True)
+                    for child in children:
+                        # print(f"Killing child: {child.pid} {child.name()}")
+                        child.kill()
+                    parent.kill()
+                    psutil.wait_procs(children)
+                    self.ns3_process.wait()
+                except psutil.NoSuchProcess:
+                    pass
+                
+                os.system("pkill -9 -f third_in_sync 2>/dev/null")
+                time.sleep(1)
+                # os.system("pkill -9 -f third_in_sync")
+                # os.system("pkill -9 -f waf")
+                # os.system("pkill -9 -f run.py")
+
+        print("Free Memory", flush=True)
+        py_interface.FreeMemory()
+        # py_interface.ResetAll()
+        # del self.rl
+        # gc.collect()
+        # time.sleep(0.1)
+
+        # os.system("ipcrm -M 1234 2>/dev/null")
+        os.system("ipcs -m | awk '/rl624/ {print $2}' | xargs -r ipcrm -m 2>/dev/null")
+
+        # print("Waiting for C++ to format memory...")
+        # while True and self.ns3_process is not None:
+        #     line = self.ns3_process.stdout.readline()
+        #     if not line:
+        #         break
+        #     print(f"ns3: {line.strip()}") # Keep printing ns-3 logs so you can see them
+            
+        #     if "[C++] Initialised memblock, waiting..." in line:
+        #         print("C++ memory formatted! Python is attaching...")
+        #         break
+
+
+        print("Init", flush=True)
+        # print(f"isFinish before Init: {self.rl.isFinish()}", flush=True)
+        py_interface.Init(self.pool_id + self.ns3_args['sim_num'], 4096)
+
+        print("INITIALISED", flush=True)
+        self.rl = py_interface.Ns3AIRL(self.rl_id + self.ns3_args['sim_num'], Env, Act)
+
+        print("Ns3AIRL", flush=True)
         env = os.environ.copy()
         # TODO: Make this cleaner and add logging, so it will be easier to debug.
         env["PATH"] = f"{os.path.dirname(self.python2_path)}:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin"
@@ -193,24 +308,30 @@ class RLEnv(EnvBase):
             env.pop(key, None)
 
         args_str = [f'--{key}={value}' for key, value in self.ns3_args.items()]
-        subprocess.Popen([self.python2_path, "run.py", *args_str], env=env, text=True)
+        self.ns3_process = subprocess.Popen([self.python2_path, "run.py", *args_str], env=env, text=True) #, preexec_fn=os.setsid) # stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+        self.ns3_args['sim_num'] += 1
+        # print("WAITING FOR NS3", flush=True)
+        # for i in range(10):
+        #     print(i+1, flush=True)
+        #     time.sleep(1)
+
     
     def get_obs(self, data):
         new_obs = torch.tensor([
             [
-                agent.BW / 1e10,              # Scale by max expected bandwidth
-                agent.txRate / 1e10, 
-                agent.averageQLength / 1000,  # Scale by typical max queue
-                agent.txRateECN / 1e10,
-                agent.k_min_in / 1000,
-                agent.k_max_in / 1000,
+                agent.BW,            
+                agent.txRate, 
+                agent.averageQLength,
+                agent.txRateECN,
+                agent.k_min_in,
+                agent.k_max_in,
                 agent.p_max_in
             ]
             for agent in data.env.agents
         ], device=self.device, dtype=torch.float32)
 
         new_obs = new_obs.view(*self.batch_size, NUM_STATE_PARAMS)
-        return new_obs
+        return new_obs / self.OBS_SCALE
 
 
     def _step(self, td): # td = tensordict
@@ -225,15 +346,40 @@ class RLEnv(EnvBase):
 
         with self.rl as data:
             if data is None:
-                done = torch.ones(*self.batch_size, dtype=torch.bool, device=self.device)
-                new_obs = self.last_obs
-                reward = torch.zeros(*self.batch_size, 1, dtype=torch.float32, device=self.device)
+                print("TRIGGERED", flush=True)
+                # done = torch.ones(*self.batch_size, dtype=torch.bool, device=self.device)
+                # new_obs = self.last_obs
+                # reward = torch.zeros(*self.batch_size, 1, dtype=torch.float32, device=self.device)
                 
                 self.sim_done = True
+                return TensorDict({
+                    "observation": self.last_obs,
+                    "reward": torch.zeros(*self.batch_size, 1, dtype=torch.float32, device=self.device),
+                    "done": torch.ones(*self.batch_size, 1, dtype=torch.bool, device=self.device),
+                    "terminated": torch.ones(*self.batch_size, 1, dtype=torch.bool, device=self.device),
+                    "truncated": torch.zeros(*self.batch_size, 1, dtype=torch.bool, device=self.device)
+                }, batch_size=self.batch_size, device=self.device)
             else:
+                # =========== DEBUGGING start_ns3_simulation =============
+                # print("SETTING done flag", flush=True)
+                # self.sim_done = True
+                # return TensorDict({
+                #     "observation": self.last_obs,
+                #     "reward": torch.zeros(*self.batch_size, 1, dtype=torch.float32, device=self.device),
+                #     "done": torch.ones(*self.batch_size, 1, dtype=torch.bool, device=self.device),
+                #     "terminated": torch.ones(*self.batch_size, 1, dtype=torch.bool, device=self.device),
+                #     "truncated": torch.zeros(*self.batch_size, 1, dtype=torch.bool, device=self.device)
+                # }, batch_size=self.batch_size, device=self.device)
+                # =========================================================
+                
                 for i in range(NUM_AGENTS):
+                    if i == 1:
+                        # print(f'Python: k_min={actions[i, 0].item()}, k_max={actions[i, 0].item() + actions[i, 1].item()}, p_max={actions[i, 2].item()}', flush=True)
+                        k_min = actions[i, 0].item()
+                        if k_min == float('nan'):
+                            raise Exception("Threshold is nan")
                     data.act.agents[i].k_min_out = actions[i, 0].item()
-                    data.act.agents[i].k_max_out = actions[i, 1].item()
+                    data.act.agents[i].k_delta_out = actions[i, 1].item()
                     data.act.agents[i].p_max_out = actions[i, 2].item()
 
                 new_obs = self.get_obs(data)
@@ -244,7 +390,9 @@ class RLEnv(EnvBase):
 
             truncated = torch.tensor([[self.rl.isFinish()] for _ in range(NUM_AGENTS)], dtype=torch.bool, device=self.device)
             terminated = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
-            done = truncated | terminated  
+            done = truncated | terminated 
+
+            # print(new_obs)
 
             return TensorDict({
                 "observation": new_obs,
@@ -257,27 +405,42 @@ class RLEnv(EnvBase):
     def _reset(self, tensordict: TensorDictBase | None = None):
         
         if self.sim_done:
+            # TODO: probably need a way to kill the old process so that two simulations don't start running causes a problem with the shared memory.
+            print("CALLING start_ns3_simulation", flush=True)
             self.start_ns3_simulation()
 
             print("STARTED ns3 simulation")
             
-            # TODO: Research how to shared memory locks work properly.
+            # TODO: Research how do shared memory locks work properly.
             new_obs = None
+            count =0 # FOR DEBUGGING
             while new_obs is None:
-                print("GETTING FIRST obs")
+                if self.ns3_process.poll() is not None:
+                    raise RuntimeError(f"ns-3 process died unexpectedly...")
+                if count % 100 == 0:
+                    print(f"STUCK in received first obs: count={count}, isFinish: {self.rl.isFinish()}", flush=True)
                 with self.rl as data:  # Calls rl.Acquire() and rl.ReleaseMemory() on __enter__ and __exit__ respectively.
                     if data is not None:
                         new_obs = self.get_obs(data)
+                        # for i in range(NUM_AGENTS):
+                        #     data.act.agents[i].k_min_out = 1500
+                        #     data.act.agents[i].k_delta_out = 1500
+                        #     data.act.agents[i].p_max_out = 0.1
                         print("RECEIVED FIRST obs")
+                    else:
+                        print(f"Data is None! isFinish={self.rl.isFinish()}", flush=True)
+                count += 1
+                time.sleep(0.01)
 
             print("Control back to python")
             self.sim_done = False
         else:
-            new_obs = torch.zeros(*self.batch_size, NUM_STATE_PARAMS, dtype=torch.float32, device=self.device)
-            with self.rl as data:
-                if data is not None:
-                    new_obs = self.get_obs(data)
-                    print(f"New obs shape: {new_obs.shape}")
+            # new_obs = torch.zeros(*self.batch_size, NUM_STATE_PARAMS, dtype=torch.float32, device=self.device)
+            # with self.rl as data:
+            #     if data is not None:
+            #         new_obs = self.get_obs(data)
+            #         print(f"New obs shape: {new_obs.shape}")
+            new_obs = self.last_obs
         
        
         res = TensorDict(
@@ -296,7 +459,40 @@ class RLEnv(EnvBase):
 
     def _calculate_reward(self, env_data):
         # reward = -avgQLength
-        rewards = torch.tensor([-env_data.agents[i].averageQLength for i in range(NUM_AGENTS)], dtype=torch.float32, device=self.device)
+        rewards = []
+        for i in range(NUM_AGENTS):
+            txRate = env_data.agents[i].txRate
+            avg_q_len = env_data.agents[i].averageQLength
+            # Calculate min n, such that E(n) > L, E(n) = a * (2**n)
+            n_power = 0
+            for n in range(1, 10):
+                n_power = n
+                if self.alpha * 2**n > avg_q_len:
+                    break
+
+            T = txRate / 100_000_000_000
+            D = 1 - n_power / 10
+            # print(f'txRate: {txRate}, avg_q_len: {avg_q_len}, weighted txRate: {self.w * txRate}, weighted avg_q_len: {(1-self.w) * avg_q_len}')
+            # print(f'T: {T}, D: {D}, weighted T: {self.w * T}, weighted D: {(1-self.w) * D}')
+            r = self.w * T - (1-self.w) * D
+            rewards.append(r)
+
+            # ====== FOR DEBUGGING/ MONITORING =========
+            self.reward_history[i]["rewards"].append(r)
+            self.reward_history[i]["q_lengths"].append(avg_q_len)
+            self.reward_history[i]["throughput"].append(txRate)
+            self.reward_history[i]["n"].append(n_power)
+            self.reward_history[i]["T"].append(T)
+            self.reward_history[i]["D"].append(D)
+            # TODO: Is this for the previous timestep?
+            self.reward_history[i]["k_min"].append(env_data.agents[i].k_min_in)
+            self.reward_history[i]["k_max"].append(env_data.agents[i].k_max_in)
+            self.reward_history[i]["p_max"].append(env_data.agents[i].p_max_in)
+
+            # if i == 0:
+            #     print(f"Agent {i}: txRate={txRate}, avg_q_len={avg_q_len}", flush=True)
+
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         return rewards
 
 class MultiAgentPolicyWrapper(nn.Module):
@@ -306,7 +502,7 @@ class MultiAgentPolicyWrapper(nn.Module):
 
     def forward(self, tensordict):
         output_tds = []
-        # print(tensordict.shape)
+        
         for i, policy in enumerate(self.policies):
             out_td = policy(tensordict[i])
             output_tds.append(out_td)
@@ -318,8 +514,8 @@ class MultiAgentPolicyWrapper(nn.Module):
         return tensordict
     
 
-py_interface.Init(1234, 4096)
-rl = py_interface.Ns3AIRL(2333, Env, Act)
+# py_interface.Init(1234, 4096)
+# rl = py_interface.Ns3AIRL(2333, Env, Act)
 
 is_fork = multiprocessing.get_start_method() == "fork"
 device = (
@@ -327,14 +523,30 @@ device = (
     if torch.cuda.is_available() and not is_fork
     else torch.device("cpu")
 )
-env = RLEnv(rl, device=device)
+env = RLEnv(None, device=device)
 
-actor_net = SNNNetwork(NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS)
+use_snn = False
+
+actor_in_keys = ["observation"]
+if use_snn:
+    actor_in_keys = ["observation", "hidden_states"]
+    actor_out_keys = ["raw_output", ("next", "hidden_states")]
+    actor_net = SNNNetwork(NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS)
+else:
+    actor_in_keys = ["observation"]
+    actor_out_keys = ["raw_output"]
+    actor_net = nn.Sequential(
+        nn.Linear(NUM_STATE_PARAMS, NUM_HIDDEN_CELLS),
+        nn.ReLU(),
+        nn.Linear(NUM_HIDDEN_CELLS, NUM_HIDDEN_CELLS),
+        nn.ReLU(),
+        nn.Linear(NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS)
+    )
 
 actor_module = TensorDictModule(
     actor_net,
-    in_keys=["observation", "hidden_states"],
-    out_keys=["raw_output", ("next", "hidden_states")] # This will move the output hidden state for timestep t-1  to the hidden_state for timestep t.
+    in_keys=actor_in_keys,
+    out_keys=actor_out_keys
 )
 
 extraction_module = TensorDictModule(
@@ -383,13 +595,13 @@ value_module = value_module.to(device)
 multi_agent_policy_module(env.reset())
 value_module(env.reset())
 
-frames_per_batch = 1024
+# frames_per_batch = 1024
 total_frames = TOTAL_FRAMES
 
 collector = SyncDataCollector(
     env,
     multi_agent_policy_module,
-    frames_per_batch=frames_per_batch,
+    frames_per_batch=NUM_DESIRED_SEQUENCES * SEQUENCE_LENGTH,
     total_frames=total_frames,
     split_trajs=False,
     device=device,
@@ -417,7 +629,7 @@ samplers = [SliceSampler(
 replay_buffers = [TensorDictReplayBuffer(
     storage=LazyMemmapStorage(max_size=10000),#LazyTensorStorage(max_size=frames_per_batch),
     sampler=samplers[i],#SamplerWithoutReplacement(),
-    batch_size=frames_per_batch // SEQUENCE_LENGTH,  # 10 sequences per batch?
+    batch_size=(NUM_DESIRED_SEQUENCES * SEQUENCE_LENGTH) // NUM_MINI_BATCHES, # i.e. num_frames_per_batch / num_mini_batches = num_frames_per_mini_batch
 ) for i in range(NUM_AGENTS)]
 
 entropy_eps = 1e-4
@@ -441,7 +653,7 @@ loss_modules = [ClipPPOLoss(
 
 optims = [torch.optim.Adam(loss_modules[i].parameters(), lr) for i in range(NUM_AGENTS)]
 schedulers = [torch.optim.lr_scheduler.CosineAnnealingLR(
-    optims[i], total_frames // frames_per_batch, 0.0
+    optims[i], total_frames // (NUM_DESIRED_SEQUENCES * SEQUENCE_LENGTH), 0.0
 ) for i in range(NUM_AGENTS)]
 
 logs = defaultdict(list)
@@ -450,7 +662,7 @@ eval_str = ""
 
 perform_eval = True
 
-batch_offset = 20  # If training was interrupted use this to load the previous models and continue the training.
+batch_offset = 117  # If training was interrupted use this to load the previous models and continue the training.
 if batch_offset != 0:
     for agent_num in range(NUM_AGENTS):
         print(f"Loading policy: {agent_num}")
@@ -461,22 +673,23 @@ if batch_offset != 0:
 if not perform_eval:
     NUM_EPOCHS = 10
     tracked_data = {agent_num: {} for agent_num in range(NUM_AGENTS)}
-    print("REACHED LOOP")
+    print("REACHED LOOP", flush=True)
 
     for i, tensordict_data in enumerate(collector):
-        print("Batch collected")
-        print(tensordict_data)
+        print("Batch collected", flush=True)
+        # print(tensordict_data)
         batch_num = i + batch_offset  # TEMPORARY: interrupted training
         for epoch in range(NUM_EPOCHS):
             advantage_module(tensordict_data)
-            print(f"Batch {i + batch_offset}, epoch {epoch}")
+            print(f"Batch {i + batch_offset}, epoch {epoch}", flush=True)
             for agent_num in range(NUM_AGENTS):
-                print(f"Agent {agent_num}")
+                print(f"Agent {agent_num}", flush=True)
                 replay_buffers[agent_num].extend(tensordict_data[agent_num])
                 
-                for _ in range(frames_per_batch // SEQUENCE_LENGTH):
+                for _ in range(NUM_DESIRED_SEQUENCES // NUM_MINI_BATCHES): 
                     subdata = replay_buffers[agent_num].sample()
-                    subdata = subdata.view(4, SEQUENCE_LENGTH)
+                    # print(f"batch_size: {tensordict_data[agent_num].shape}, subdata shape: {subdata.shape}, num_sequences: {NUM_DESIRED_SEQUENCES}, sl: {SEQUENCE_LENGTH}")
+                    subdata = subdata.view(NUM_DESIRED_SEQUENCES // NUM_MINI_BATCHES, SEQUENCE_LENGTH)
 
                     loss_vals = loss_modules[agent_num](subdata.to(device))
                     loss_value = (
@@ -485,36 +698,76 @@ if not perform_eval:
                         + loss_vals["loss_entropy"]
                     )
 
+                    # ADD THESE CHECKS
+                    if torch.isnan(loss_value):
+                        print(f"NaN loss at batch {batch_num}, epoch {epoch}, agent {agent_num}", flush=True)
+                        print(f"  loss_objective: {loss_vals['loss_objective']}", flush=True)
+                        print(f"  loss_critic: {loss_vals['loss_critic']}", flush=True)
+                        print(f"  loss_entropy: {loss_vals['loss_entropy']}", flush=True)
                     # Optimization: backward, grad clipping and optimization step
                     loss_value.backward()
+
+                    # grad_norm = torch.nn.utils.clip_grad_norm_(loss_modules[agent_num].parameters(), max_grad_norm)
+                    # if torch.isnan(grad_norm):
+                    #     print(f"NaN grad norm at batch {batch_num}, epoch {epoch}, agent {agent_num}", flush=True)
+
                     # this is not strictly mandatory but it's good practice to keep
                     # your gradient norm bounded
                     torch.nn.utils.clip_grad_norm_(loss_modules[agent_num].parameters(), max_grad_norm)
                     optims[agent_num].step()
                     optims[agent_num].zero_grad()
+
+                    # Check weights after update
+                    # for name, param in local_policies[agent_num].named_parameters():
+                    #     if torch.isnan(param).any():
+                    #         print(f"NaN weight in {name} at batch {batch_num}, epoch {epoch}, agent {agent_num}", flush=True)
+                    #         break
+
                 schedulers[agent_num].step()
-                
-        if batch_num % 5 == 0:
+            # env.save_reward_history()
+           
+
+        if batch_num % 3 == 0:
             with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                print("RUNNING EVAL ROLLOUT")
-                eval_rollout = env.rollout(1000, multi_agent_policy_module)
+                print("RUNNING EVAL ROLLOUT", flush=True)
+                eval_rollout = env.rollout(500, multi_agent_policy_module)
+                # ========== DEBUGGING =============
+                # Check for nan in actions and rewards
+                actions = eval_rollout["action"]
+                rewards = eval_rollout["next", "reward"]
+                print(f"NaN in actions: {torch.isnan(actions).any()}", flush=True)
+                print(f"NaN in rewards: {torch.isnan(rewards).any()}", flush=True)
+                
+                # Find the first step where nan appears
+                nan_steps = torch.isnan(actions).any(dim=-1).any(dim=0)  # shape: [steps]
+                if nan_steps.any():
+                    first_nan_step = nan_steps.nonzero()[0].item()
+                    print(f"First NaN action at step: {first_nan_step}", flush=True)
+                    print(f"Action at step {first_nan_step}: {actions[:, first_nan_step]}", flush=True)
+                    print(f"Observation at step {first_nan_step}: {eval_rollout['observation'][:, first_nan_step]}", flush=True)
+                # ===================================
+
+                print(eval_rollout, flush=True)
+                print(eval_rollout["next", "reward"], flush=True)
                 mean_reward = eval_rollout["next", "reward"].mean(dim=1)
                 q_lengths = eval_rollout["observation"][:, :, OBS.averageQLength.value]
                 mean_q_length = q_lengths.mean(dim=1)
-                print("MEAN REWARD: ", mean_reward)
-                print("MEAN Q LENGTH: ", mean_q_length)
+                print("MEAN REWARD: ", mean_reward, flush=True)
+                print("MEAN Q LENGTH: ", mean_q_length, flush=True)
                 for agent_num in range(NUM_AGENTS):
                     tracked_data[agent_num][i] = {
                         "mean_reward": mean_reward[agent_num].item(),
                         "mean_q_length": mean_q_length[agent_num].item()
                     }
-                print("TRACKED DATA: ", tracked_data)
+                print("TRACKED DATA: ", tracked_data, flush=True)
 
-                with open('../trained_models_data.txt', 'a') as f:
-                    for agent_num in range(NUM_AGENTS):
-                        f.write(f"Agent {agent_num}:\n")
-                        for batch_num, data in tracked_data[agent_num].items():
-                            f.write(f"{batch_num},{data['mean_reward']},{data['mean_q_length']}\n")
+                with open('../trained_models_data.txt', 'w') as f:
+                    json.dump(tracked_data, f)
+
+                    # for agent_num in range(NUM_AGENTS):
+                    #     f.write(f"Agent {agent_num}:\n")
+                    #     for batch_num, data in tracked_data[agent_num].items():
+                    #         f.write(f"{batch_num},{data['mean_reward']},{data['mean_q_length']}\n")
                 
                 for agent_num in range(NUM_AGENTS):
                     torch.save(local_policies[agent_num].state_dict(), f'../saved_models/agent_{agent_num}_batch_{i}_policy.pth')
@@ -525,9 +778,21 @@ if not perform_eval:
             for batch_num, data in tracked_data[agent_num].items():
                 f.write(f"{batch_num},{data['mean_reward']},{data['mean_q_length']}\n")
 else:
+    # max_eval_batch = 9
+    # eval_batch_diff = 3
+    # env.set_mode("eval")
+    # for batch_num in range(0, max_eval_batch + 1, eval_batch_diff):
+    #     for agent_num in range(NUM_AGENTS):
+    #         print(f"Batch: {batch_num}, Loading policy: {agent_num}", flush=True)
+    #         loaded_state_dict = torch.load(f'../saved_models/agent_{agent_num}_batch_{batch_num}_policy.pth')
+    #         local_policies[agent_num].load_state_dict(loaded_state_dict)
+
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-        print("RUNNING EVAL ROLLOUT")
-        eval_rollout = env.rollout(1000, multi_agent_policy_module)
+        print("RUNNING EVAL ROLLOUT", flush=True)
+        # env.start_ns3_simulation()  # This will stop the previous simulation and start a new one.
+        eval_rollout = env.rollout(10_000_000, multi_agent_policy_module) # Run until the simulation ends
+        print("DONE ROLLOUT", flush=True)
+        env.save_reward_history()
 
 
             
