@@ -30,6 +30,7 @@ import signal
 import psutil
 import time
 import gc
+# from torchinfo import summary
 
 class OBS(Enum):
     BW = 0
@@ -37,13 +38,14 @@ class OBS(Enum):
     averageQLength = 2
     txRateECN = 3
     k_min_in = 4
-    k_max_in = 5
+    k_delta_in = 5
     p_max_in = 6
 
 NUM_ACTIONS = 3
 NUM_STATE_PARAMS = 7
 NUM_HIDDEN_CELLS = 64
-NUM_AGENTS = 5
+NUM_HIDDEN_LAYERS = 2
+NUM_AGENTS = 5 # 640 for 320 host fat tree
 # FRAMES_PER_BATCH = 1024
 TOTAL_FRAMES = 5_000_000
 SEQUENCE_LENGTH = 16
@@ -56,61 +58,128 @@ NUM_MINI_BATCHES = 4
 
 class SNNNetwork(nn.Module):
     # TODO: Add a batch dimension so that parallel training is possible.
-    def __init__(self, num_hidden, out_features):
+    def __init__(self, num_hidden_layers, num_hidden, out_features):
         super().__init__()
         # initialize layers
         num_hidden = 64
         BETA = 0.8  # N.B. to make this a learnable parameter, wrap in nn.Parameter
         self.fc1 = nn.Linear(NUM_STATE_PARAMS, num_hidden)
-        self.lif1 = snn.Leaky(beta=BETA)
-        self.fc2 = nn.Linear(num_hidden, out_features)
+
+        self.num_hidden_layers = num_hidden_layers
+        self.num_hidden_neurons = num_hidden
+
+        self.hidden_and_output_layers = []
+        for i in range(num_hidden_layers):
+            self.hidden_and_output_layers.append(snn.Leaky(beta=BETA))
+
+            if i != num_hidden_layers - 1:
+                self.hidden_and_output_layers.append(nn.Linear(num_hidden, num_hidden))
+            else:
+                self.hidden_and_output_layers.append(nn.Linear(num_hidden, out_features))
+        self.hidden_and_output_layers = nn.ModuleList(self.hidden_and_output_layers)
 
         # TODO: Check how "SNN for time-series analysis" used a linear readout.
 
 
-    def forward(self, x, hidden_states = None):
+    def forward(self, x, hidden_states):
         # TODO: generalise mem1 (membrane potential) for all hidden states.
+        # if hidden_states is None:
+        #     # Spiking layers appear at every even index in self.hidden_and_output_layers
+        #     mems = []
+        #     for i in range(len(self.hidden_and_output_layers)):
+        #         if i % 2 == 0:
+        #             mems.append(self.hidden_and_output_layers[i].reset_mem())
+        #     mem = torch.stack(mems)
+        #     print(f'FORWARD: hidden_states is None; mem shape: {mem.shape}')
+        # else:
         if hidden_states is None:
-            mem1 = self.lif1.reset_mem()
-        else:
-            mem1 = hidden_states
+            raise Exception("hidden_states shouldn't be None when using pytorch environment as a zeroed array is returned in _reset. If using SNNNetwork without rl environment, proceed.")
+        mem = hidden_states
+            # print(f'FORWARD: hidden_states provided;mem shape: {mem.shape}')
 
-        if isinstance(mem1, torch.Tensor):
-            mem1 = mem1.to(x.device)
+        # print(f"mem type: {type(mem)}, mem device: {mem.device}")
+        if isinstance(mem, torch.Tensor):
+            mem = mem.to(x.device)
 
 
         if x.dim() == 1:  # x: [Features]
-            cur, h =  self.forward_step(x, mem1)
+            # Used for data/transition collection
+            cur, h =  self.forward_step(x, mem)
             return cur, h
-        else:  # x: [Batch, Time, Features]
-            cur, h = self.forward_sequences(x, hidden_states)
+        else:  # x: [Time, Features]
+            # Used when iterating over batches.
+            cur, h = self.forward_sequences(x, mem)
             return cur, h
 
-    def forward_step(self, x, mem1):
-        cur1 = self.fc1(x)
-        spk1, mem1 = self.lif1(cur1, mem1)
-        cur2 = self.fc2(spk1)
+    def forward_step(self, x, mem):
+        """
+        Used in the data collection phase where the collector processes individual transitions.
+        """
+        cur = self.fc1(x)
 
-        hidden_states = mem1  # TODO: ensure this works for different hidden layer configurations.
-        return cur2, hidden_states
+        spk = None
+        for i in range(len(self.hidden_and_output_layers)):
+            if i % 2 == 0:  # Spiking layer
+                mem_idx = i // 2  # As linear layers don't have a membrane potential - must index these separately.
+                # print(f'mem_layer shape: {mem[mem_idx, :].shape}, cur shape: {cur.shape}')
+                spk, new_mem = self.hidden_and_output_layers[i](cur, mem[mem_idx, :])
+                mem[mem_idx, :] = new_mem
+            else:  # Linear layer
+                cur = self.hidden_and_output_layers[i](spk)
+
+        # cur = self.fc2(spk)  # TODO: Check if this is equivalent to reading the membrane potential directly (as it should be a linear readout layer).
+        # print("SETTING HIDDEN STATES...")
+        hidden_states = mem  # TODO: ensure this works for different hidden layer configurations.
+        # print("SET HIDDEN STATES!")
+        return cur, hidden_states
 
     def forward_sequences(self, x, hidden_states):
+        """
+        Used by the loss module for a batch of sequences.
+        """
+        # TODO: This method needs to be fixed in order to work with an arbitrary number of hidden layers.
         # x is a 2D tensor of padded sequences.
-        # mem1 is the hidden states (the membrane potential of the first and only hidden layer - to be generalised for deeper models)
-        # raise Exception("HELP")
+        # mem is the hidden states (the membrane potential of the hidden layers)
+        
+        # print("USING FORWARD_SEQUENCES!!")
+        # raise Exception("Using forward_sequences - test to see if this is being used!")
+    
         outputs = []
         new_hidden_states = []
-        mem1 = hidden_states[:, 0]
-        all_cur1 = self.fc1(x)
+
+        if hidden_states.dim() == 4:
+            # 
+            # print(f'hidden_states has shape: {hidden_states.shape}')
+            mem = hidden_states[:, 0, :, :] 
+            # print(f'Mem has shape: {mem.shape}')
+        else:
+            # This may change if we slice the hidden states before passing them to the loss module.
+            raise Exception(f"Expected hidden states to have shape: [NUM_SEQUENCES//NUM_MINI_BATCHES, SEQUENCE_LENGTH, NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS], received shape: {hidden_states.shape}")
+
+        # mem = hidden_states
+        all_cur = self.fc1(x)  # Linear layer only processes the last dimension of the input tensor (i.e. only the feature dimension is used here).
+        # print(f'all_cur_shape: {all_cur.shape}')
+        # print(f'x shape: {x.shape}')
         for t in range(x.size(1)):
-            xt = all_cur1[:, t, :]
-            spk1, mem1 = self.lif1(xt, mem1)
-            cur2 = self.fc2(spk1)
-            outputs.append(cur2)
-            new_hidden_states.append(mem1)
+            cur = all_cur[:, t, :]  # Outputs of the first linear layer for all sequences (fc1(obs)).
+
+            for i in range(len(self.hidden_and_output_layers)):
+                if i % 2 == 0:
+                    mem_idx = i // 2
+                    spk, new_mem = self.hidden_and_output_layers[i](cur, mem[:, mem_idx, :])
+                    # print(f'mem size: {mem.shape}, new_mem: {new_mem.shape}')
+                    mem[:, mem_idx, :] = new_mem
+                else:
+                    cur = self.hidden_and_output_layers[i](spk)
+
+            outputs.append(cur)
+            new_hidden_states.append(mem.clone())
+            # new_hidden_states.append(mem1)
 
         outputs = torch.stack(outputs, dim = 1)
         new_hidden_states = torch.stack(new_hidden_states, dim=1)
+        # new_hidden_states = mem
+        # new_hidden_states = torch.stack(new_hidden_states, dim=1)
         return outputs, new_hidden_states
     
 class AgentEnv(Structure):
@@ -121,7 +190,7 @@ class AgentEnv(Structure):
         ("averageQLength", c_double),
         ("txRateECN", c_double),
         ("k_min_in", c_double),
-        ("k_max_in", c_double),
+        ("k_delta_in", c_double),
         ("p_max_in", c_double)
     ]
 
@@ -147,7 +216,7 @@ class Act(Structure):
 
 class RLEnv(EnvBase):
     def __init__(self, rl_interface, device="cpu"):
-        self.batch_size = torch.Size([5]) # Number of simultaneous environments running.
+        self.batch_size = torch.Size([NUM_AGENTS]) # Number of simultaneous environments running.
         super().__init__(batch_size=self.batch_size, device=device)
         # self.device = device
         self.rl = rl_interface
@@ -155,7 +224,7 @@ class RLEnv(EnvBase):
         self.observation_spec = Composite(
             observation=Unbounded(shape=(*self.batch_size, NUM_STATE_PARAMS), dtype=torch.float32, device=self.device),
             hidden_states=Unbounded(
-                shape=(*self.batch_size, NUM_HIDDEN_CELLS), 
+                shape=(*self.batch_size, NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS), 
                 dtype=torch.float32,
                 device=self.device
             ),
@@ -164,7 +233,7 @@ class RLEnv(EnvBase):
         )
 
         low = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=self.device).expand(*self.batch_size, NUM_ACTIONS)
-        high = torch.tensor([3000.0, 3000.0, 1.0], dtype=torch.float32, device=self.device).expand(*self.batch_size, NUM_ACTIONS)
+        high = torch.tensor([1_000_000.0, 1_000_000.0, 1.0], dtype=torch.float32, device=self.device).expand(*self.batch_size, NUM_ACTIONS)
 
         self.action_spec = Bounded(
             low=low,
@@ -191,10 +260,10 @@ class RLEnv(EnvBase):
         # self.cur_sim_num = 0
         self.ns3_args = {
             "cc": "dcqcn",
-            "bw": 100,
+            "bw": 50,  # NIC bandwidth
             "rl_ecn_marking": 1,
-            "trace": "web_search_5_80_0.01s",  # star_5_single_burst_trace  web_search_5_80_100s
-            "topo": "star_5",
+            "trace": 'web_search_5_80_0.1s', # "web_search_320_0.3_100s", # "web_search_5_80_3000s",  # star_5_single_burst_trace  web_search_5_80_100s
+            "topo": 'star_5', # "fat", # "star_5",
             "sim_num": 0
         }
         self.sim_done = True # Flag to determine whether to start the ns3 simulation.
@@ -205,18 +274,19 @@ class RLEnv(EnvBase):
 
         # Very important scaling to prevent exploding gradients, producing 'nan' actions.
         self.OBS_SCALE = torch.tensor([
-            1e11,   # BW
-            1e11,   # txRate
-            1e8,    # averageQLength
-            1e11,   # txRateECN
-            3000,   # k_min
-            6000,   # k_max
+            1e11/8.0,   # BW
+            1e11/8.0,   # txRate
+            1e8/8.0,    # averageQLength
+            1e11/8.0,   # txRateECN
+            # N.B. This is normalised based on the buffer size - set to 32MB in NS3.
+            1e6,   # k_min  - N.B this won't scale between 0 and 1
+            1e6,   # k_max
             1.0     # p_max
         ], dtype=torch.float32, device=self.device)
 
         # ============ FOR Debugging ==============
-        self.w = 0.2
-        self.alpha = 20
+        self.w = 0.5
+        self.alpha = 40
         self.reward_history = [{
             "rewards": [],
             "q_lengths": [],
@@ -294,7 +364,7 @@ class RLEnv(EnvBase):
 
         print("Init", flush=True)
         # print(f"isFinish before Init: {self.rl.isFinish()}", flush=True)
-        py_interface.Init(self.pool_id + self.ns3_args['sim_num'], 4096)
+        py_interface.Init(self.pool_id + self.ns3_args['sim_num'], 131072)
 
         print("INITIALISED", flush=True)
         self.rl = py_interface.Ns3AIRL(self.rl_id + self.ns3_args['sim_num'], Env, Act)
@@ -324,7 +394,7 @@ class RLEnv(EnvBase):
                 agent.averageQLength,
                 agent.txRateECN,
                 agent.k_min_in,
-                agent.k_max_in,
+                agent.k_delta_in,
                 agent.p_max_in
             ]
             for agent in data.env.agents
@@ -422,10 +492,12 @@ class RLEnv(EnvBase):
                 with self.rl as data:  # Calls rl.Acquire() and rl.ReleaseMemory() on __enter__ and __exit__ respectively.
                     if data is not None:
                         new_obs = self.get_obs(data)
+
                         # for i in range(NUM_AGENTS):
                         #     data.act.agents[i].k_min_out = 1500
                         #     data.act.agents[i].k_delta_out = 1500
                         #     data.act.agents[i].p_max_out = 0.1
+
                         print("RECEIVED FIRST obs")
                     else:
                         print(f"Data is None! isFinish={self.rl.isFinish()}", flush=True)
@@ -446,7 +518,7 @@ class RLEnv(EnvBase):
         res = TensorDict(
             {
                 "observation": new_obs,
-                "hidden_states": torch.zeros((*self.batch_size, NUM_HIDDEN_CELLS), dtype=torch.float32, device=self.device)
+                "hidden_states": torch.zeros((*self.batch_size, NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS), dtype=torch.float32, device=self.device)
             },
             batch_size=self.batch_size,
             device=self.device
@@ -465,16 +537,21 @@ class RLEnv(EnvBase):
             avg_q_len = env_data.agents[i].averageQLength
             # Calculate min n, such that E(n) > L, E(n) = a * (2**n)
             n_power = 0
-            for n in range(1, 10):
+            for n in range(0, 10):
                 n_power = n
-                if self.alpha * 2**n > avg_q_len:
+                # N.B. divide by 1000 as alpha is set in the ACC paper based on the queue length in KB but avg_q_len is in bytes here.
+                if self.alpha * 2**n > (avg_q_len/1000):
                     break
 
-            T = txRate / 100_000_000_000
+            T = txRate / (100_000_000_000 / 8)
             D = 1 - n_power / 10
             # print(f'txRate: {txRate}, avg_q_len: {avg_q_len}, weighted txRate: {self.w * txRate}, weighted avg_q_len: {(1-self.w) * avg_q_len}')
             # print(f'T: {T}, D: {D}, weighted T: {self.w * T}, weighted D: {(1-self.w) * D}')
-            r = self.w * T - (1-self.w) * D
+            r = self.w * T + (1-self.w) * D
+            # r = -avg_q_len
+
+            # if txRate < 10:
+            #     r -= 1000000000
             rewards.append(r)
 
             # ====== FOR DEBUGGING/ MONITORING =========
@@ -486,7 +563,7 @@ class RLEnv(EnvBase):
             self.reward_history[i]["D"].append(D)
             # TODO: Is this for the previous timestep?
             self.reward_history[i]["k_min"].append(env_data.agents[i].k_min_in)
-            self.reward_history[i]["k_max"].append(env_data.agents[i].k_max_in)
+            self.reward_history[i]["k_max"].append(env_data.agents[i].k_delta_in)
             self.reward_history[i]["p_max"].append(env_data.agents[i].p_max_in)
 
             # if i == 0:
@@ -504,6 +581,11 @@ class MultiAgentPolicyWrapper(nn.Module):
         output_tds = []
         
         for i, policy in enumerate(self.policies):
+            # print(f"Tensordict shape: {tensordict.shape}")
+            # print(f"Calling policy: data shape: {tensordict[i].shape}")
+            # print(f"Observation shape: {tensordict[i]['observation'].shape}")
+            # print(f"Hidden states shape: {tensordict[i]['hidden_states'].shape}")
+            
             out_td = policy(tensordict[i])
             output_tds.append(out_td)
             
@@ -525,23 +607,30 @@ device = (
 )
 env = RLEnv(None, device=device)
 
-use_snn = False
+use_snn = True
 
 actor_in_keys = ["observation"]
 if use_snn:
     actor_in_keys = ["observation", "hidden_states"]
     actor_out_keys = ["raw_output", ("next", "hidden_states")]
-    actor_net = SNNNetwork(NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS)
+    actor_net = SNNNetwork(NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS)
 else:
     actor_in_keys = ["observation"]
     actor_out_keys = ["raw_output"]
+
+    hidden_layers = []
+    for _ in range(NUM_HIDDEN_LAYERS):
+        hidden_layers.append(nn.Linear(NUM_HIDDEN_CELLS, NUM_HIDDEN_CELLS))
+        hidden_layers.append(nn.ReLU())
+
     actor_net = nn.Sequential(
         nn.Linear(NUM_STATE_PARAMS, NUM_HIDDEN_CELLS),
         nn.ReLU(),
-        nn.Linear(NUM_HIDDEN_CELLS, NUM_HIDDEN_CELLS),
-        nn.ReLU(),
+        *hidden_layers,
         nn.Linear(NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS)
     )
+
+# summary(actor_net, input_size=(NUM_STATE_PARAMS,))
 
 actor_module = TensorDictModule(
     actor_net,
@@ -601,7 +690,7 @@ total_frames = TOTAL_FRAMES
 collector = SyncDataCollector(
     env,
     multi_agent_policy_module,
-    frames_per_batch=NUM_DESIRED_SEQUENCES * SEQUENCE_LENGTH,
+    frames_per_batch=NUM_DESIRED_SEQUENCES * SEQUENCE_LENGTH * NUM_AGENTS,
     total_frames=total_frames,
     split_trajs=False,
     device=device,
@@ -661,12 +750,13 @@ pbar = tqdm(total=total_frames)
 eval_str = ""
 
 perform_eval = True
+saved_models_suffix = "snn_2_hidden_layer_30_batches"
 
-batch_offset = 117  # If training was interrupted use this to load the previous models and continue the training.
+batch_offset = 30  # If training was interrupted use this to load the previous models and continue the training.
 if batch_offset != 0:
     for agent_num in range(NUM_AGENTS):
         print(f"Loading policy: {agent_num}")
-        loaded_state_dict = torch.load(f'../saved_models/agent_{agent_num}_batch_{batch_offset}_policy.pth')
+        loaded_state_dict = torch.load(f'../saved_models_{saved_models_suffix}/agent_{agent_num}_batch_{batch_offset}_policy.pth')
         local_policies[agent_num].load_state_dict(loaded_state_dict)
 
 # DO TRAINING!
@@ -683,13 +773,15 @@ if not perform_eval:
             advantage_module(tensordict_data)
             print(f"Batch {i + batch_offset}, epoch {epoch}", flush=True)
             for agent_num in range(NUM_AGENTS):
-                print(f"Agent {agent_num}", flush=True)
+                # print(f"Agent {agent_num}", flush=True)
                 replay_buffers[agent_num].extend(tensordict_data[agent_num])
                 
                 for _ in range(NUM_DESIRED_SEQUENCES // NUM_MINI_BATCHES): 
                     subdata = replay_buffers[agent_num].sample()
                     # print(f"batch_size: {tensordict_data[agent_num].shape}, subdata shape: {subdata.shape}, num_sequences: {NUM_DESIRED_SEQUENCES}, sl: {SEQUENCE_LENGTH}")
                     subdata = subdata.view(NUM_DESIRED_SEQUENCES // NUM_MINI_BATCHES, SEQUENCE_LENGTH)
+
+                    # print(f"Subdata shape: {subdata.shape}")
 
                     loss_vals = loss_modules[agent_num](subdata.to(device))
                     loss_value = (
@@ -727,7 +819,7 @@ if not perform_eval:
             # env.save_reward_history()
            
 
-        if batch_num % 3 == 0:
+        if batch_num % 10 == 0:
             with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
                 print("RUNNING EVAL ROLLOUT", flush=True)
                 eval_rollout = env.rollout(500, multi_agent_policy_module)

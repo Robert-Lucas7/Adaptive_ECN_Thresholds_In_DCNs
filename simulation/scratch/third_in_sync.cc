@@ -103,14 +103,14 @@ unordered_map<uint64_t, double> rate2pmax;
 int sim_num;
 string instant_qlen_mon_file;
 int rl_ecn_marking;
-uint64_t instant_qlen_mon_end = 2010000000;  // stop at 2.1 seconds - traffic starts at 2 seconds.  (60000 ns approx for burst to mitigate with 400Gbps)
+uint64_t instant_qlen_mon_end = 2100000000;  // stop at 2.1 seconds - traffic starts at 2 seconds.  (60000 ns approx for burst to mitigate with 400Gbps)
 uint64_t instant_qlen_mon_start = 2000000000;  // start at 2 seconds
 // N.B. This will need to be decreased.
 uint64_t instant_qlen_mon_interval = 1000;  // 20 microsecond interval - measure the instantaneous queue length.
 
 uint32_t agent_inference_interval = 41600; // One order of magnitude larger than the max RTT // 200 microseconds inference interval
 
-#define NUM_AGENTS 5
+#define NUM_AGENTS 5  // Num end-hosts for incast, 640 for 320 host fat tree topo.
 
 struct AgentEnv
 {
@@ -119,7 +119,7 @@ struct AgentEnv
 	double averageQLength;
 	double txRateECN;
 	double k_min_in;
-	double k_max_in;
+	double k_delta_in;
 	double p_max_in;
 } Packed;
 
@@ -179,7 +179,7 @@ private:
 	int m_port;
 	uint64_t m_lastTx;
 	// N.B. In sw->m_mmu, these are the data types for k_min, k_max, p_max. TODO: Check if k_min and k_max can be fully continuous (i.e. double as well)
-	uint32_t m_curKmin, m_curKmax;
+	uint32_t m_curKmin, m_curKmax, m_curKdelta;
 	double m_curPmax;
 	
 	uint64_t m_bandWidth;
@@ -249,23 +249,24 @@ AgentEnv Agent::getState(){
     m_elapsedTime = (now - m_lastTime).GetNanoSeconds();
     m_lastTime = now;
 
-	double txRate = getAverageDataOutputRate();
-	double txRateECN = getAverageECNMarkedOutputRate();
+	double txRate = getAverageDataOutputRate();  // bytes per seconds
+	double txRateECN = getAverageECNMarkedOutputRate();  // bytes per second
 	Ptr<QbbNetDevice> qbbDev = DynamicCast<QbbNetDevice>(m_sw->GetDevice(m_port));
 	uint64_t bw;
 	if (qbbDev) {
-		bw = qbbDev->GetDataRate().GetBitRate();
+		bw = qbbDev->GetDataRate().GetBitRate() / 8.0;  // bytes per second
 	} else {
 		throw std::runtime_error("Cannot get bw - qbbDev is null");
 	}
-	double avgQLen = GetAverageQueueLength();
+	double avgQLen = GetAverageQueueLength(); // bytes per second
 	// N.B. m_port is 1-indexed in this script, use 0-indexing in python so decrement this by 1 here.
 	env.BW = bw;
 	env.txRate = txRate;
 	env.averageQLength = avgQLen;
 	env.txRateECN = txRateECN;
 	env.k_min_in = m_curKmin;
-	env.k_max_in = m_curKmax;
+	//
+	env.k_delta_in = m_curKdelta;
 	env.p_max_in = m_curPmax;
 	return env;
 	// m_curKmin = static_cast<uint32_t>(ecnParameters[0]);
@@ -280,12 +281,17 @@ AgentEnv Agent::getState(){
 void Agent::setECNParameters(AgentAct agentAct) {
 	if (m_adaptive_ecn){
 		m_curKmin = static_cast<uint32_t>(agentAct.k_min_out);
-		uint32_t kdelta = static_cast<uint32_t>(agentAct.k_delta_out);
+		m_curKdelta = static_cast<uint32_t>(agentAct.k_delta_out);
 
-		m_curKmax = m_curKmin + kdelta;
+		m_curKmax = m_curKmin + m_curKdelta;
 		m_curPmax = agentAct.p_max_out;
 
-		m_sw->m_mmu->ConfigEcn(m_port, m_curKmin, m_curKmax, m_curPmax);
+		// std::cout << "k_min: " << m_curKmin << "k_max: " << m_curKmax << "p_max: " << m_curPmax << std::endl;
+
+		m_sw->m_mmu->ConfigEcn(m_port, m_curKmin/1000, m_curKmax/1000, m_curPmax);
+
+		// m_curKmin = m_curKmin * 1000;  // Represent thresholds in Bytes to match other scales in observation.
+		// m_curKmax = m_curKmax * 1000;
 
 		std::tuple<uint32_t, uint32_t, double> ecnThreshold;
 		ecnThreshold = make_tuple(m_curKmin, m_curKmax, m_curPmax);
@@ -299,7 +305,7 @@ double Agent::getAverageECNMarkedOutputRate() {
 
 	m_txRateECN = 0;
 	if (windowDurationNs > 0) {
-        m_txRateECN = (m_ecnBytesInWindow * 8.0) / windowDurationNs;
+        m_txRateECN = m_ecnBytesInWindow / (windowDurationNs / 1000000000.0);
     }
 	// std::cout << "ECN BYTES: " << m_ecnBytesInWindow  << " Window size: " << windowDurationNs << std::endl;
     m_ecnBytesInWindow = 0;
@@ -315,7 +321,7 @@ double Agent::getAverageDataOutputRate() {
 
 	uint64_t bytesSent = curTxRate - m_lastTx;
 	m_lastTx = curTxRate;
-	double txRate = (bytesSent * 8) / (m_elapsedTime / 1000000000.0);  // TODO: should this inference interval be measured, as assuming its not perfect timing.
+	double txRate = (bytesSent) / (m_elapsedTime / 1000000000.0);  // TODO: should this inference interval be measured, as assuming its not perfect timing.
 	return txRate;
 }
 
@@ -345,7 +351,7 @@ double Agent::GetAverageQueueLength() {
     m_qArea = 0;
     m_QlenWindowStartTime = now;
 
-	return avgQ * 8;  // Average queue length in bits
+	return avgQ;  // Average queue length in bytes
 }
 
 void Agent::TraceEnqueue(Ptr<const Packet> p, uint32_t priority) {
@@ -504,7 +510,7 @@ void write_state_to_file(FILE *output_file, std::vector<AgentEnv>* combinedEnv) 
 		for (auto &it : agentStates) {
 			fprintf(output_file, "%lu\n", it.first);
 			for (auto &it2 : it.second) {
-				fprintf(output_file, "%lu %f %f %f %f %f %f\n", it2.BW, it2.txRate, it2.averageQLength, it2.txRateECN, it2.k_min_in, it2.k_max_in, it2.p_max_in);
+				fprintf(output_file, "%lu %f %f %f %f %f %f\n", it2.BW, it2.txRate, it2.averageQLength, it2.txRateECN, it2.k_min_in, it2.k_delta_in, it2.p_max_in);
 			}
 		}
 		fflush(output_file);
@@ -574,7 +580,7 @@ double getAverageDataOutputRate(Ptr<SwitchNode> m_sw, int m_port, uint32_t inter
 	double averageQLength;
 	double txRateECN;
 	double k_min_in;
-	double k_max_in;
+	double k_delta_in;
 	double p_max_in;
 } Packed;*/
 
@@ -1298,10 +1304,10 @@ int main(int argc, char *argv[])
 		uint16_t pool_id = 1234 + sim_num;
 		std::cout << "[C++] Initialising memblock with key: " << memblock_key << std::endl;
 		ns3::GlobalValue::Bind("SharedMemoryKey", ns3::UintegerValue(pool_id));
-		ns3::GlobalValue::Bind("SharedMemoryPoolSize", ns3::UintegerValue(4096));
+		ns3::GlobalValue::Bind("SharedMemoryPoolSize", ns3::UintegerValue(131072));
 		commInterface = new CommInterface(memblock_key);
 		std::cout << "[C++] Initialised memblock, waiting..." << std::endl;
-		sleep(5);
+		// sleep(5);
 		std::cout << "Finished wait" << std::endl;
 	}
 	// ==================================================================================
