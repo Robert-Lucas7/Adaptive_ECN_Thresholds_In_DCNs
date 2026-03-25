@@ -30,6 +30,7 @@ import signal
 import psutil
 import time
 import gc
+from snntorch import spikegen
 # from torchinfo import summary
 
 class OBS(Enum):
@@ -40,6 +41,10 @@ class OBS(Enum):
     k_min_in = 4
     k_delta_in = 5
     p_max_in = 6
+
+class ENCODING(Enum):
+    DIRECT = 0
+    DELTA = 1
 
 NUM_ACTIONS = 3
 NUM_STATE_PARAMS = 7
@@ -58,8 +63,23 @@ NUM_MINI_BATCHES = 4
 
 class SNNNetwork(nn.Module):
     # TODO: Add a batch dimension so that parallel training is possible.
-    def __init__(self, num_hidden_layers, num_hidden, out_features):
+    def __init__(self, num_hidden_layers, num_hidden, out_features, encoding_in, encoding_out):
         super().__init__()
+
+        if encoding_out != ENCODING.DIRECT:
+            raise Exception("Only Direct Encoding is currently supported for the output.")
+
+        self.encoding_in = encoding_in  # Enum
+        self.DELTA_THRESHOLD = torch.tensor([
+            0.50,  # Col 0: Appears to be a constant/binary 1.0. High threshold to ignore noise.
+            0.05,  # Col 1: txRate. Shows meaningful fluctuations (e.g., 0.05 to 0.51).
+            0.01,  # Col 2: averageQLength. Very small values (1e-8) but critical when they rise.
+            0.10,  # Col 3: txRateECN. Mostly zero, but needs to spike on change.
+            0.05,  # Col 4: k_min. Dynamic range between 0.04 and 0.99.
+            0.05,  # Col 5: k_delta. Dynamic range between 0.02 and 0.98.
+            0.05   # Col 6: p_max. Highly stochastic.
+        ], device='cuda:0')
+
         # initialize layers
         num_hidden = 64
         BETA = 0.8  # N.B. to make this a learnable parameter, wrap in nn.Parameter
@@ -81,40 +101,39 @@ class SNNNetwork(nn.Module):
         # TODO: Check how "SNN for time-series analysis" used a linear readout.
 
 
-    def forward(self, x, hidden_states):
-        # TODO: generalise mem1 (membrane potential) for all hidden states.
-        # if hidden_states is None:
-        #     # Spiking layers appear at every even index in self.hidden_and_output_layers
-        #     mems = []
-        #     for i in range(len(self.hidden_and_output_layers)):
-        #         if i % 2 == 0:
-        #             mems.append(self.hidden_and_output_layers[i].reset_mem())
-        #     mem = torch.stack(mems)
-        #     print(f'FORWARD: hidden_states is None; mem shape: {mem.shape}')
-        # else:
+    def forward(self, x, hidden_states, prev_obs):
         if hidden_states is None:
             raise Exception("hidden_states shouldn't be None when using pytorch environment as a zeroed array is returned in _reset. If using SNNNetwork without rl environment, proceed.")
+        
         mem = hidden_states
-            # print(f'FORWARD: hidden_states provided;mem shape: {mem.shape}')
 
-        # print(f"mem type: {type(mem)}, mem device: {mem.device}")
         if isinstance(mem, torch.Tensor):
             mem = mem.to(x.device)
 
 
         if x.dim() == 1:  # x: [Features]
             # Used for data/transition collection
-            cur, h =  self.forward_step(x, mem)
-            return cur, h
+            cur, h, new_prev_obs =  self.forward_step(x, mem, prev_obs)
+            return cur, h, new_prev_obs
         else:  # x: [Time, Features]
             # Used when iterating over batches.
-            cur, h = self.forward_sequences(x, mem)
-            return cur, h
+            cur, h, new_prev_obs = self.forward_sequences(x, mem, prev_obs)
+            return cur, h, new_prev_obs
 
-    def forward_step(self, x, mem):
+    def forward_step(self, x, mem, prev_obs):
         """
         Used in the data collection phase where the collector processes individual transitions.
         """
+        if self.encoding_in == ENCODING.DELTA:
+            diff = x - prev_obs
+
+            pos_spikes = (diff > self.DELTA_THRESHOLD).float()
+            neg_spikes = (diff < -self.DELTA_THRESHOLD).float() * -1.0
+            encoded_spikes = pos_spikes + neg_spikes
+
+            new_prev_obs = x.clone()
+            x = encoded_spikes
+
         cur = self.fc1(x)
 
         spk = None
@@ -127,13 +146,12 @@ class SNNNetwork(nn.Module):
             else:  # Linear layer
                 cur = self.hidden_and_output_layers[i](spk)
 
-        # cur = self.fc2(spk)  # TODO: Check if this is equivalent to reading the membrane potential directly (as it should be a linear readout layer).
-        # print("SETTING HIDDEN STATES...")
+        
         hidden_states = mem  # TODO: ensure this works for different hidden layer configurations.
-        # print("SET HIDDEN STATES!")
-        return cur, hidden_states
+        
+        return cur, hidden_states, new_prev_obs
 
-    def forward_sequences(self, x, hidden_states):
+    def forward_sequences(self, x, hidden_states, prev_obs):
         """
         Used by the loss module for a batch of sequences.
         """
@@ -141,22 +159,26 @@ class SNNNetwork(nn.Module):
         # x is a 2D tensor of padded sequences.
         # mem is the hidden states (the membrane potential of the hidden layers)
         
-        # print("USING FORWARD_SEQUENCES!!")
-        # raise Exception("Using forward_sequences - test to see if this is being used!")
-    
+        continuous_x = x
         outputs = []
         new_hidden_states = []
+        new_prev_obs = []
 
         if hidden_states.dim() == 4:
-            # 
-            # print(f'hidden_states has shape: {hidden_states.shape}')
-            mem = hidden_states[:, 0, :, :] 
-            # print(f'Mem has shape: {mem.shape}')
+            mem = hidden_states[:, 0, :, :]  # Only get the first hidden state as the others will be outdated.
         else:
             # This may change if we slice the hidden states before passing them to the loss module.
             raise Exception(f"Expected hidden states to have shape: [NUM_SEQUENCES//NUM_MINI_BATCHES, SEQUENCE_LENGTH, NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS], received shape: {hidden_states.shape}")
 
-        # mem = hidden_states
+        if self.encoding_in == ENCODING.DELTA:
+            diff = continuous_x - prev_obs
+            
+            # Generate the spikes (-1, 0, 1) manually exactly like in forward_step
+            pos_spikes = (diff > self.DELTA_THRESHOLD).float()
+            neg_spikes = (diff < -self.DELTA_THRESHOLD).float() * -1.0
+            
+            x = pos_spikes + neg_spikes
+
         all_cur = self.fc1(x)  # Linear layer only processes the last dimension of the input tensor (i.e. only the feature dimension is used here).
         # print(f'all_cur_shape: {all_cur.shape}')
         # print(f'x shape: {x.shape}')
@@ -178,9 +200,10 @@ class SNNNetwork(nn.Module):
 
         outputs = torch.stack(outputs, dim = 1)
         new_hidden_states = torch.stack(new_hidden_states, dim=1)
+        new_prev_obs = continuous_x
         # new_hidden_states = mem
         # new_hidden_states = torch.stack(new_hidden_states, dim=1)
-        return outputs, new_hidden_states
+        return outputs, new_hidden_states, new_prev_obs
     
 class AgentEnv(Structure):
     _pack_ = 1
@@ -401,6 +424,7 @@ class RLEnv(EnvBase):
         ], device=self.device, dtype=torch.float32)
 
         new_obs = new_obs.view(*self.batch_size, NUM_STATE_PARAMS)
+        # print(new_obs / self.OBS_SCALE)
         return new_obs / self.OBS_SCALE
 
 
@@ -518,11 +542,13 @@ class RLEnv(EnvBase):
         res = TensorDict(
             {
                 "observation": new_obs,
-                "hidden_states": torch.zeros((*self.batch_size, NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS), dtype=torch.float32, device=self.device)
+                "hidden_states": torch.zeros((*self.batch_size, NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS), dtype=torch.float32, device=self.device),
+                "prev_obs": torch.zeros((*self.batch_size, NUM_STATE_PARAMS), dtype=torch.float32, device=self.device)  # N.B. this is only used for delta modulation (temporal encoding) input.
             },
             batch_size=self.batch_size,
             device=self.device
         )
+
         return res
 
     def _set_seed(self, seed: int | None = None, static_seed: bool = False):
@@ -611,9 +637,9 @@ use_snn = True
 
 actor_in_keys = ["observation"]
 if use_snn:
-    actor_in_keys = ["observation", "hidden_states"]
-    actor_out_keys = ["raw_output", ("next", "hidden_states")]
-    actor_net = SNNNetwork(NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS)
+    actor_in_keys = ["observation", "hidden_states", "prev_obs"]
+    actor_out_keys = ["raw_output", ("next", "hidden_states"), ("next", "prev_obs")]
+    actor_net = SNNNetwork(NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS, ENCODING.DELTA, ENCODING.DIRECT)
 else:
     actor_in_keys = ["observation"]
     actor_out_keys = ["raw_output"]
@@ -750,9 +776,9 @@ pbar = tqdm(total=total_frames)
 eval_str = ""
 
 perform_eval = True
-saved_models_suffix = "snn_2_hidden_layer_30_batches"
+saved_models_suffix = "snn_2_hidden_layer_delta_modulation_input"
 
-batch_offset = 30  # If training was interrupted use this to load the previous models and continue the training.
+batch_offset = 40  # If training was interrupted use this to load the previous models and continue the training.
 if batch_offset != 0:
     for agent_num in range(NUM_AGENTS):
         print(f"Loading policy: {agent_num}")
