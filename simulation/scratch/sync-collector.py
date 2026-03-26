@@ -32,6 +32,7 @@ import time
 import gc
 from snntorch import spikegen
 # from torchinfo import summary
+import argparse
 
 class OBS(Enum):
     BW = 0
@@ -46,20 +47,66 @@ class ENCODING(Enum):
     DIRECT = 0
     DELTA = 1
 
+# Create parser with description
+parser = argparse.ArgumentParser(description="RL parser")
+
+# TODO: use these arguments to name the saved_models directory and add a appropriate suffix.
+parser.add_argument("--network_type", type=str, default="ann", help="ANN or SNN")
+parser.add_argument("--eval", action="store_true", help="Eval mode")
+parser.add_argument("--batch_offset", type=int, default=0, help="Batch offset for eval")
+parser.add_argument("--hidden_layers", type=int, default=1, help="Num hidden layers")
+parser.add_argument("--hidden_neurons", type=int, default=64, help="Num hidden cells")
+parser.add_argument("--enc_in", type=str, default="direct", help="Encoding in - only for snn")
+parser.add_argument("--enc_out", type=str, default="direct", help="Encoding out - only for snn")
+
+# Optional argument
+parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed output")
+
+args = parser.parse_args()
+
+BATCH_OFFSET = args.batch_offset
+NUM_HIDDEN_LAYERS = args.hidden_layers
+NUM_HIDDEN_CELLS = args.hidden_neurons
+INPUT_ENCODING = ENCODING[args.enc_in.upper()]
+OUTPUT_ENCODING = ENCODING[args.enc_out.upper()]
+PERFORM_EVAL = args.eval
+
+
+if args.network_type.lower() == "snn":
+    USE_SNN = True
+else:
+    USE_SNN = False
+
+print("============ CURRENT CONFIG ==============")
+print(f"NETWORK: {'snn' if USE_SNN else 'ann'}", flush=True)
+
+if USE_SNN:
+    print(f"INPUT_ENCODING: {INPUT_ENCODING}", flush=True)
+    print(f"OUTPUT_ENCODING: {OUTPUT_ENCODING}", flush=True)
+
+print(f"PERFORM_EVAL: {PERFORM_EVAL}", flush=True)
+print(f"BATCH_OFFSET: {BATCH_OFFSET}", flush=True)
+print(f"NUM_HIDDEN_LAYERS: {NUM_HIDDEN_LAYERS}", flush=True)
+print(f"NUM_HIDDEN_CELLS: {NUM_HIDDEN_CELLS}", flush=True)
+print("==========================================")
+
+
+# raise Exception("TESTING")
+
 NUM_ACTIONS = 3
 NUM_STATE_PARAMS = 7
-NUM_HIDDEN_CELLS = 64
-NUM_HIDDEN_LAYERS = 2
+
 NUM_AGENTS = 5 # 640 for 320 host fat tree
 # FRAMES_PER_BATCH = 1024
 TOTAL_FRAMES = 5_000_000
 SEQUENCE_LENGTH = 16
-TOTAL_BUFFER_SIZE = 1000  # TODO: REMOVE
 
 # N.B. NUM_DESIRED_SEQUENCES must be divisible by NUM_MINI_BATCHES.
 NUM_DESIRED_SEQUENCES = 64
 NUM_MINI_BATCHES = 4
 
+if NUM_DESIRED_SEQUENCES % NUM_MINI_BATCHES != 0:
+    raise Exception("NUM_DESIRED_SEQUENCES must be divisible by NUM_MINI_BATCHES.")
 
 class SNNNetwork(nn.Module):
     # TODO: Add a batch dimension so that parallel training is possible.
@@ -81,7 +128,7 @@ class SNNNetwork(nn.Module):
         ], device='cuda:0')
 
         # initialize layers
-        num_hidden = 64
+        self.num_hidden = num_hidden
         BETA = 0.8  # N.B. to make this a learnable parameter, wrap in nn.Parameter
         self.fc1 = nn.Linear(NUM_STATE_PARAMS, num_hidden)
 
@@ -124,6 +171,7 @@ class SNNNetwork(nn.Module):
         """
         Used in the data collection phase where the collector processes individual transitions.
         """
+        new_prev_obs = x.clone()
         if self.encoding_in == ENCODING.DELTA:
             diff = x - prev_obs
 
@@ -131,7 +179,6 @@ class SNNNetwork(nn.Module):
             neg_spikes = (diff < -self.DELTA_THRESHOLD).float() * -1.0
             encoded_spikes = pos_spikes + neg_spikes
 
-            new_prev_obs = x.clone()
             x = encoded_spikes
 
         cur = self.fc1(x)
@@ -285,15 +332,18 @@ class RLEnv(EnvBase):
             "cc": "dcqcn",
             "bw": 50,  # NIC bandwidth
             "rl_ecn_marking": 1,
-            "trace": 'web_search_5_80_0.1s', # "web_search_320_0.3_100s", # "web_search_5_80_3000s",  # star_5_single_burst_trace  web_search_5_80_100s
+             # "web_search_320_0.3_100s", # "web_search_5_80_3000s",  # star_5_single_burst_trace  web_search_5_80_100s
             "topo": 'star_5', # "fat", # "star_5",
             "sim_num": 0
         }
+        if PERFORM_EVAL:
+            self.ns3_args["trace"] = 'web_search_5_80_0.1s'
+        else:
+            self.ns3_args["trace"] = 'web_search_5_80_3000s'
+
         self.sim_done = True # Flag to determine whether to start the ns3 simulation.
 
         self.ns3_process = None
-
-        
 
         # Very important scaling to prevent exploding gradients, producing 'nan' actions.
         self.OBS_SCALE = torch.tensor([
@@ -401,6 +451,9 @@ class RLEnv(EnvBase):
             env.pop(key, None)
 
         args_str = [f'--{key}={value}' for key, value in self.ns3_args.items()]
+        if PERFORM_EVAL:
+            args_str.append("--perform_eval")
+
         self.ns3_process = subprocess.Popen([self.python2_path, "run.py", *args_str], env=env, text=True) #, preexec_fn=os.setsid) # stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
         self.ns3_args['sim_num'] += 1
         # print("WAITING FOR NS3", flush=True)
@@ -503,7 +556,7 @@ class RLEnv(EnvBase):
             print("CALLING start_ns3_simulation", flush=True)
             self.start_ns3_simulation()
 
-            print("STARTED ns3 simulation")
+            print("STARTED ns3 simulation", flush=True)
             
             # TODO: Research how do shared memory locks work properly.
             new_obs = None
@@ -522,13 +575,13 @@ class RLEnv(EnvBase):
                         #     data.act.agents[i].k_delta_out = 1500
                         #     data.act.agents[i].p_max_out = 0.1
 
-                        print("RECEIVED FIRST obs")
+                        print("RECEIVED FIRST obs", flush=True)
                     else:
                         print(f"Data is None! isFinish={self.rl.isFinish()}", flush=True)
                 count += 1
                 time.sleep(0.01)
 
-            print("Control back to python")
+            print("Control back to python", flush=True)
             self.sim_done = False
         else:
             # new_obs = torch.zeros(*self.batch_size, NUM_STATE_PARAMS, dtype=torch.float32, device=self.device)
@@ -633,13 +686,12 @@ device = (
 )
 env = RLEnv(None, device=device)
 
-use_snn = True
-
 actor_in_keys = ["observation"]
-if use_snn:
+if USE_SNN:
+    print("Using SNN", flush=True)
     actor_in_keys = ["observation", "hidden_states", "prev_obs"]
     actor_out_keys = ["raw_output", ("next", "hidden_states"), ("next", "prev_obs")]
-    actor_net = SNNNetwork(NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS, ENCODING.DELTA, ENCODING.DIRECT)
+    actor_net = SNNNetwork(NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS, INPUT_ENCODING, OUTPUT_ENCODING)
 else:
     actor_in_keys = ["observation"]
     actor_out_keys = ["raw_output"]
@@ -775,18 +827,25 @@ logs = defaultdict(list)
 pbar = tqdm(total=total_frames)
 eval_str = ""
 
-perform_eval = True
-saved_models_suffix = "snn_2_hidden_layer_delta_modulation_input"
+saved_models_suffix = f"{'snn' if USE_SNN else 'ann'}_{NUM_HIDDEN_LAYERS}_hidden_layers_{NUM_HIDDEN_CELLS}_hidden_cells_{INPUT_ENCODING.name}_{OUTPUT_ENCODING.name}"
 
-batch_offset = 40  # If training was interrupted use this to load the previous models and continue the training.
-if batch_offset != 0:
+# If training was interrupted use this to load the previous models and continue the training.
+if BATCH_OFFSET != 0:
     for agent_num in range(NUM_AGENTS):
-        print(f"Loading policy: {agent_num}")
-        loaded_state_dict = torch.load(f'../saved_models_{saved_models_suffix}/agent_{agent_num}_batch_{batch_offset}_policy.pth')
+        print(f"Loading policy: {agent_num}", flush=True)
+        loaded_state_dict = torch.load(f'../saved_models_{saved_models_suffix}/agent_{agent_num}_batch_{BATCH_OFFSET}_policy.pth')
         local_policies[agent_num].load_state_dict(loaded_state_dict)
 
 # DO TRAINING!
-if not perform_eval:
+if not PERFORM_EVAL:
+    BATCH_LIMIT = 40  # TODO: remove. This is temporary whilst the "reset sim" functionality does not work correctly - to end the training before the reset occurs (found empirically)
+    # Check if 'saved_models' directory exists.
+    if os.path.isdir(f'../saved_models_{saved_models_suffix}') is False:
+        os.mkdir(f'../saved_models_{saved_models_suffix}')
+    else:
+        raise Exception(f'folder saved_models_{saved_models_suffix} already exists! Delete Manually if desired.')
+
+
     NUM_EPOCHS = 10
     tracked_data = {agent_num: {} for agent_num in range(NUM_AGENTS)}
     print("REACHED LOOP", flush=True)
@@ -794,10 +853,14 @@ if not perform_eval:
     for i, tensordict_data in enumerate(collector):
         print("Batch collected", flush=True)
         # print(tensordict_data)
-        batch_num = i + batch_offset  # TEMPORARY: interrupted training
+        batch_num = i + BATCH_OFFSET  # TEMPORARY: interrupted training
+        if i > BATCH_LIMIT:
+            print("BATCH_LIMIT reached - finishing now!", flush=True)
+            break
+
         for epoch in range(NUM_EPOCHS):
             advantage_module(tensordict_data)
-            print(f"Batch {i + batch_offset}, epoch {epoch}", flush=True)
+            print(f"Batch {i + BATCH_OFFSET}, epoch {epoch}", flush=True)
             for agent_num in range(NUM_AGENTS):
                 # print(f"Agent {agent_num}", flush=True)
                 replay_buffers[agent_num].extend(tensordict_data[agent_num])
@@ -888,7 +951,7 @@ if not perform_eval:
                     #         f.write(f"{batch_num},{data['mean_reward']},{data['mean_q_length']}\n")
                 
                 for agent_num in range(NUM_AGENTS):
-                    torch.save(local_policies[agent_num].state_dict(), f'../saved_models/agent_{agent_num}_batch_{i}_policy.pth')
+                    torch.save(local_policies[agent_num].state_dict(), f'../saved_models_{saved_models_suffix}/agent_{agent_num}_batch_{i}_policy.pth')
 
     with open('../../trained_models_data.txt', 'w') as f:
         for agent_num in range(NUM_AGENTS):
@@ -896,15 +959,6 @@ if not perform_eval:
             for batch_num, data in tracked_data[agent_num].items():
                 f.write(f"{batch_num},{data['mean_reward']},{data['mean_q_length']}\n")
 else:
-    # max_eval_batch = 9
-    # eval_batch_diff = 3
-    # env.set_mode("eval")
-    # for batch_num in range(0, max_eval_batch + 1, eval_batch_diff):
-    #     for agent_num in range(NUM_AGENTS):
-    #         print(f"Batch: {batch_num}, Loading policy: {agent_num}", flush=True)
-    #         loaded_state_dict = torch.load(f'../saved_models/agent_{agent_num}_batch_{batch_num}_policy.pth')
-    #         local_policies[agent_num].load_state_dict(loaded_state_dict)
-
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         print("RUNNING EVAL ROLLOUT", flush=True)
         # env.start_ns3_simulation()  # This will stop the previous simulation and start a new one.
