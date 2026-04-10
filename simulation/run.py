@@ -11,7 +11,7 @@ TOPOLOGY_FILE mix/{topo}.txt
 FLOW_FILE mix/{trace}.txt
 TRACE_FILE mix/trace.txt
 TRACE_OUTPUT_FILE mix/mix_{topo}_{trace}_{cc}{failure}.tr
-FCT_OUTPUT_FILE mix/fct_{topo}_{trace}_{cc}{failure}.txt
+FCT_OUTPUT_FILE mix/fct_{topo}_{trace}_{rl_ecn_marking}_{cc}{failure}.txt
 PFC_OUTPUT_FILE mix/pfc_{topo}_{trace}_{cc}{failure}.txt
 
 SIMULATOR_STOP_TIME 4.00
@@ -59,11 +59,13 @@ PMAX_MAP {pmax_map}
 BUFFER_SIZE {buffer_size}
 QLEN_MON_FILE mix/qlen_{topo}_{trace}_{cc}{failure}.txt
 QLEN_MON_START 2000000000
-QLEN_MON_END 3000000000
+QLEN_MON_END 2100000000
 
 
-INSTANT_QLEN_MON_FILE mix/instant_qlen_{topo}_{trace}_{cc}{failure}_{rl_ecn_marking}.txt
+INSTANT_QLEN_MON_FILE mix/instant_qlen_{topo}_{trace}_{cc}{failure}_{rl_ecn_marking}_{w}.txt
 RL_ECN_MARKING {rl_ecn_marking}
+SIM_NUM {sim_num}
+PERFORM_EVAL {perform_eval}
 """
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser(description='run simulation')
@@ -80,6 +82,14 @@ if __name__ == "__main__":
 	parser.add_argument('--enable_tr', dest='enable_tr', action = 'store', type=int, default=0, help="enable packet-level events dump")
 	# ================================== My Changes - Robert Lucas ========================================
 	parser.add_argument('--rl_ecn_marking', dest='rl_ecn_marking', action = 'store', type=int, default=0)
+	# N.B. Arguments below are for finding the optimal static ECN thresholds to determine the best performance - with genetic algorithm.
+	parser.add_argument('--optimise_static_thresholds', dest='optimise_static_thresholds', action='store', default=0, type=int, help="whether optimising for optimal static thresholds")
+	parser.add_argument('--k_min', dest='k_min', action='store', default=0, type=int, help="k_min to use in sim")
+	parser.add_argument('--k_max', dest='k_max', action='store', default=0, type=int, help="k_max to use in sim")
+	parser.add_argument('--p_max', dest='p_max', action='store', default=0, type=float, help="p_max to use in sim")
+	parser.add_argument('--w', dest='w', action='store', default='', type=str, help="weighting for throughput and (1-w) average queue length")
+	parser.add_argument('--sim_num', dest='sim_num', action='store', default=0, type=int, help="The number times the simulation has been run.")
+	parser.add_argument('--perform_eval', action='store_true', help="Whether an evaluation is being ran")
 	# =====================================================================================================
 	args = parser.parse_args()
 
@@ -101,15 +111,33 @@ if __name__ == "__main__":
 
 	config_name = "mix/config_%s_%s_%s%s.txt"%(topo, trace, args.cc, failure)
 
-	kmax_map = "2 %d %d %d %d"%(bw*1000000000, 400*bw/25, bw*4*1000000000, 400*bw*4/25)
-	kmin_map = "2 %d %d %d %d"%(bw*1000000000, 100*bw/25, bw*4*1000000000, 100*bw*4/25)
-	pmax_map = "2 %d %.2f %d %.2f"%(bw*1000000000, 0.2, bw*4*1000000000, 0.2)
-
 	# ================================ My Changes - Robert Lucas ============================
+	if args.perform_eval:
+		perform_eval = 1
+	else:
+		perform_eval = 0
+		
+	w = args.w
+	sim_num = args.sim_num
 	rl_ecn_marking = args.rl_ecn_marking  # Added parameter to add RL agents for adaptive ECN marking when using DCQCN.
 
 	if rl_ecn_marking and not args.cc.startswith("dcqcn"):
 		raise Exception("Cannot use adaptive ECN marking without using DCQCN.")
+
+	# =======================================================================================
+	kmax_map = "2 %d %d %d %d"%(bw*1000000000, 400*bw/25, bw*4*1000000000, 400*bw*4/25)
+	kmin_map = "2 %d %d %d %d"%(bw*1000000000, 100*bw/25, bw*4*1000000000, 100*bw*4/25)
+	pmax_map = "2 %d %.2f %d %.2f"%(bw*1000000000, 0.2, bw*4*1000000000, 0.2)
+	# ================================== My Changes - Robert Lucas
+	if (args.optimise_static_thresholds == 1):
+		k_min = args.k_min
+		k_max = args.k_max
+		p_max = args.p_max
+
+		kmin_map = "1 %d %d"%(bw*1000000000, k_min)
+		kmax_map = "1 %d %d"%(bw*1000000000, k_max)
+		pmax_map = "1 %d %.2f"%(bw*1000000000, p_max)
+		
 	# =======================================================================================
 
 	if (args.cc.startswith("dcqcn")):
@@ -117,7 +145,7 @@ if __name__ == "__main__":
 		hai = 50 * bw /25
 
 		if args.cc == "dcqcn":
-			config = config_template.format(bw=bw, trace=trace, topo=topo, cc=args.cc, mode=1, t_alpha=1, t_dec=4, t_inc=300, g=0.00390625, ai=ai, hai=hai, dctcp_ai=1000, has_win=0, vwin=0, us=0, u_tgt=u_tgt, mi=mi, int_multi=1, pint_log_base=pint_log_base, pint_prob=pint_prob, ack_prio=1, link_down=args.down, failure=failure, kmax_map=kmax_map, kmin_map=kmin_map, pmax_map=pmax_map, buffer_size=bfsz, enable_tr=enable_tr,rl_ecn_marking=rl_ecn_marking)
+			config = config_template.format(bw=bw, trace=trace, topo=topo, cc=args.cc, mode=1, t_alpha=1, t_dec=4, t_inc=300, g=0.00390625, ai=ai, hai=hai, dctcp_ai=1000, has_win=0, vwin=0, us=0, u_tgt=u_tgt, mi=mi, int_multi=1, pint_log_base=pint_log_base, pint_prob=pint_prob, ack_prio=1, link_down=args.down, failure=failure, kmax_map=kmax_map, kmin_map=kmin_map, pmax_map=pmax_map, buffer_size=bfsz, enable_tr=enable_tr,rl_ecn_marking=rl_ecn_marking, w=w, sim_num=sim_num, perform_eval=perform_eval)
 		elif args.cc == "dcqcn_paper":
 			config = config_template.format(bw=bw, trace=trace, topo=topo, cc=args.cc, mode=1, t_alpha=50, t_dec=50, t_inc=55, g=0.00390625, ai=ai, hai=hai, dctcp_ai=1000, has_win=0, vwin=0, us=0, u_tgt=u_tgt, mi=mi, int_multi=1, pint_log_base=pint_log_base, pint_prob=pint_prob, ack_prio=1, link_down=args.down, failure=failure, kmax_map=kmax_map, kmin_map=kmin_map, pmax_map=pmax_map, buffer_size=bfsz, enable_tr=enable_tr,rl_ecn_marking=rl_ecn_marking)
 		elif args.cc == "dcqcn_vwin":

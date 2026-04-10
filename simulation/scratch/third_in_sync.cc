@@ -55,7 +55,9 @@ NS_LOG_COMPONENT_DEFINE("GENERIC_SIMULATION");
 uint32_t cc_mode = 1;
 bool enable_qcn = true, use_dynamic_pfc_threshold = true;
 uint32_t packet_payload_size = 1000, l2_chunk_size = 0, l2_ack_interval = 0;
-double pause_time = 5, simulator_stop_time = 3.01;  // N.B. this needs to be changed between training and evaluation to prevent an infinite loop in UpdateECNParameters.
+double pause_time = 5;
+double simulator_stop_time;
+
 std::string data_rate, link_delay, topology_file, flow_file, trace_file, trace_output_file;
 std::string fct_output_file = "fct.txt";
 std::string pfc_output_file = "pfc.txt";
@@ -103,6 +105,7 @@ unordered_map<uint64_t, double> rate2pmax;
 int sim_num;
 string instant_qlen_mon_file;
 int rl_ecn_marking;
+int perform_eval;
 uint64_t instant_qlen_mon_end = 2100000000;  // stop at 2.1 seconds - traffic starts at 2 seconds.  (60000 ns approx for burst to mitigate with 400Gbps)
 uint64_t instant_qlen_mon_start = 2000000000;  // start at 2 seconds
 // N.B. This will need to be decreased.
@@ -110,13 +113,14 @@ uint64_t instant_qlen_mon_interval = 1000;  // 20 microsecond interval - measure
 
 uint32_t agent_inference_interval = 41600; // One order of magnitude larger than the max RTT // 200 microseconds inference interval
 
-#define NUM_AGENTS 5  // Num end-hosts for incast, 640 for 320 host fat tree topo.
+#define NUM_AGENTS 60  // Num end-hosts for incast, 640 for 320 host fat tree topo.
 
 struct AgentEnv
 {
 	uint64_t BW;
 	double txRate;
 	double averageQLength;
+	uint32_t maxQLength;
 	double txRateECN;
 	double k_min_in;
 	double k_delta_in;
@@ -194,6 +198,7 @@ private:
 	Time m_lastTime;
 	uint64_t m_elapsedTime;
 	bool m_adaptive_ecn;
+	uint32_t m_maxQLength;
 
 	double getAverageDataOutputRate();
 
@@ -217,7 +222,11 @@ Agent::Agent(Ptr<SwitchNode> sw, int port, bool adaptive_ecn) : m_sw(sw), m_port
 {
 	m_curKmin = sw->m_mmu->kmin[port];
 	m_curKmax = sw->m_mmu->kmax[port];
+	m_curKdelta = m_curKmax - m_curKmin;
 	m_curPmax = sw->m_mmu->pmax[port];
+	m_maxQLength = 0;
+
+	std::cout << "K_min: " << m_curKmin << " K_max: " << m_curKmax << " P_max: " << m_curPmax << "K_delta: " << m_curKdelta << std::endl;
 
 	Ptr<NetDevice> device = m_sw->GetDevice(m_port);
 	Ptr<QbbNetDevice> qbbDev = DynamicCast<QbbNetDevice>(device);
@@ -259,10 +268,13 @@ AgentEnv Agent::getState(){
 		throw std::runtime_error("Cannot get bw - qbbDev is null");
 	}
 	double avgQLen = GetAverageQueueLength(); // bytes per second
+	double maxQLen = m_maxQLength;
+	m_maxQLength = 0;  // Reset m_maxQLength to 0.
 	// N.B. m_port is 1-indexed in this script, use 0-indexing in python so decrement this by 1 here.
 	env.BW = bw;
 	env.txRate = txRate;
 	env.averageQLength = avgQLen;
+	env.maxQLength = maxQLen;
 	env.txRateECN = txRateECN;
 	env.k_min_in = m_curKmin;
 	//
@@ -356,7 +368,12 @@ double Agent::GetAverageQueueLength() {
 
 void Agent::TraceEnqueue(Ptr<const Packet> p, uint32_t priority) {
     UpdateArea();
+	
     m_currentQlen += p->GetSize();
+
+	if (m_currentQlen > m_maxQLength) {
+		m_maxQLength = m_currentQlen;
+	}
 }
 
 void Agent::TraceDequeue(Ptr<const Packet> p, uint32_t priority) {
@@ -510,7 +527,7 @@ void write_state_to_file(FILE *output_file, std::vector<AgentEnv>* combinedEnv) 
 		for (auto &it : agentStates) {
 			fprintf(output_file, "%lu\n", it.first);
 			for (auto &it2 : it.second) {
-				fprintf(output_file, "%lu %f %f %f %f %f %f\n", it2.BW, it2.txRate, it2.averageQLength, it2.txRateECN, it2.k_min_in, it2.k_delta_in, it2.p_max_in);
+				fprintf(output_file, "%lu %f %f %lu %f %f %f %f\n", it2.BW, it2.txRate, it2.averageQLength, it2.maxQLength, it2.txRateECN, it2.k_min_in, it2.k_delta_in, it2.p_max_in);
 			}
 		}
 		fflush(output_file);
@@ -539,7 +556,7 @@ void UpdateECNParameters(vector<Agent*> agents, CommInterface* commInterface, FI
 	// std::cout << "[C++] Successfully received action from Python!" << std::endl;
 
 	// std::cout << "In C++ Control loop" << std::endl;
-	if (Simulator::Now().GetTimeStep() < instant_qlen_mon_end) { // simulator_stop_time * 1000000000 ){ // simulator_stop_time * 1000000000) {
+	if ((perform_eval == 1 && Simulator::Now().GetTimeStep() < instant_qlen_mon_end) || (perform_eval == 0 && Simulator::Now().GetTimeStep() < simulator_stop_time * 1000000000)) { // simulator_stop_time * 1000000000 ){ // simulator_stop_time * 1000000000) {
 		Simulator::Schedule(NanoSeconds(agent_inference_interval), &UpdateECNParameters, agents, commInterface, instantaneous_qlen_output, n);
 	} else {
 		std::cout << "TRAFFIC FINISHED STOPPING UPDATEECN"<< std::endl;
@@ -1110,6 +1127,9 @@ int main(int argc, char *argv[])
 			}  else if (key.compare("SIM_NUM") == 0) {
 				conf >> sim_num;
 				std::cout << "SIM_NUM\t\t\t\t" << sim_num << '\n';
+			} else if (key.compare("PERFORM_EVAL") == 0) {
+				conf >> perform_eval;
+				std::cout << "PERFORM_EVAL\t\t\t\t" << perform_eval << '\n';
 			}
 			// =========================================================================================
 			else if (key.compare("MULTI_RATE") == 0){
@@ -1139,6 +1159,14 @@ int main(int argc, char *argv[])
 		fflush(stdout);
 		return 1;
 	}
+
+	// ============================ My Changes - Robert Lucas ==============================
+	if (perform_eval == 1) {
+		simulator_stop_time = 3.01;
+	} else { // Training
+		simulator_stop_time = 3003.01;
+	}  // N.B. this needs to be changed between training and evaluation to prevent an infinite loop in UpdateECNParameters.
+	// =====================================================================================
 
 	bool dynamicth = use_dynamic_pfc_threshold;
 
