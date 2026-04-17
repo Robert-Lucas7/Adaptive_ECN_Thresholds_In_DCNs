@@ -5,6 +5,9 @@ import json
 from collections import Counter
 import numpy as np
 
+axes_font_size = 24
+legend_font_size = 18
+
 most_recent_rl = "../../simulation/mix/instant_qlen_star_5_{trace}_dcqcn_1_.txt"
 most_recent_static = "../../simulation/mix/instant_qlen_star_5_{trace}_dcqcn_0_.txt"
 
@@ -19,9 +22,19 @@ data_info = [
 {
     "label": "Static - default",
     "fp": most_recent_static.format(trace="web_search_5_80_0.1s")
-},
+}
+
 # {
-#     "label": "Static - GA",
+#     "label": "Aggressive ECN parameters",
+#     "fp": "../../simulation/mix/instant_qlen_star_5_agressive_static.txt"
+# },
+# {
+#     "label": "Relaxed ECN parameters",
+#     "fp": "../../simulation/mix/instant_qlen_star_5_relaxed_static.txt"
+# },
+
+# {
+#     "label": "RL",
 #     "fp": "../../simulation/mix/instant_qlen_star_5_{trace}_dcqcn_0_GA.txt".format(trace="web_search_5_80_0.1s")
 # }
 ]
@@ -39,45 +52,68 @@ PORT = 1
 
 
 # TODO: move/modify script to import this function from utils so there is only one instance of it.
+
 def get_instantaneous_data(fp):
+    """
+    Parse the data from an "instant_qlen" file generated from the NS3 simulation into
+    a suitable python object with the format:
+    [
+        time: {
+            agent1: {
+                port1: {
+                    "bw": bw,
+                    "txRate": txRate,
+                    "averageQLength": averageQLength,
+                    etc
+                },
+                portN: {...}
+            },
+            agentN: {...}
+        },
+        timeN: {...}
+    ]
+    """
     all_data = []
     with open(fp, 'r') as f:
         all_lines = f.readlines()
         cur_timestep_data = {}
         cur_time = None
+        port_num = 0
         for i, line in enumerate(all_lines):
-            elems = line.strip().split(' ')
-            if len(elems) == 1:
+            if line[:4].upper() == "TIME":
                 if cur_time is not None:
                     all_data.append({
                         cur_time: cur_timestep_data
                     })
                     cur_timestep_data = {}
-                cur_time = int(elems[0])
-                agent_num = 0
+                cur_time = int(line.split()[1].strip())
+            elif line[:5].upper() == "AGENT":
+                agent_num = int(line.split()[1].strip())
+                cur_timestep_data[agent_num] = {}
+                port_num = 0
             else:
-                bw, txRate, averageQLength, maxQLength, txRateECN, k_min, k_delta, p_max = [float(x) for x in elems]
-                cur_timestep_data[agent_num] = {
+                elems = line.strip().split(' ')
+                bw, txRate, averageQLength, txRateECN, k_min, k_delta, p_max = [float(x) for x in elems]
+                cur_timestep_data[agent_num][port_num] = {
                     "bw": bw,
                     "txRate": txRate,
                     "averageQLength": averageQLength,
-                    "maxQLength": maxQLength,
                     "txRateECN": txRateECN,
                     "k_min": k_min,
                     "k_delta": k_delta,
                     "p_max": p_max,
                 }
-                agent_num += 1
-
-                # Ensure the last timesteps data is added
-                if i == len(all_lines) - 1:
-                    all_data.append({
-                        cur_time: cur_timestep_data
-                    })
+                port_num += 1
+            # Ensure the last timesteps data is added
+            if i == len(all_lines) - 1:
+                all_data.append({
+                    cur_time: cur_timestep_data
+                })
     print(len(all_data))
     return all_data #  [:500] #[:20000]
 
-AGENT = 1
+AGENT = 0
+PORT = 0
 
 data = [
         {
@@ -94,35 +130,28 @@ data = [
 def calculate_reward(timestep_data, w, alpha):
     avg_q_len = timestep_data["averageQLength"]
     txRate = timestep_data["txRate"]
-    max_q_len = timestep_data["maxQLength"]
 
-    # n_power = 0
-    # for n in range(1, 10):
-    #     n_power = n
-    #     if alpha * 2**n > (avg_q_len/1000):
-    #         break
+    n_power = 0
+    for n in range(1, 10):
+        n_power = n
+        if alpha * 2**n > (avg_q_len/1000):
+            break
 
-    T = txRate / (100_000_000_000 / 8.0)
+    T = txRate / (100_000_000_000 / 8.0)  # Link utilisation.
     # D = 1 - n_power / 10
     # print(f'txRate: {txRate}, avg_q_len: {avg_q_len}, weighted txRate: {self.w * txRate}, weighted avg_q_len: {(1-self.w) * avg_q_len}')
     # print(f'T: {T}, D: {D}, weighted T: {self.w * T}, weighted D: {(1-self.w) * D}')
     # r = w * T + (1 - w) * D
 
-    max_tolerated_max_qlen = 100_000.0
-    
-    Q_max = max(0.0, 1.0 - (max_q_len / max_tolerated_max_qlen))
-    
-    max_tolerated_q = 250_000.0
-    Q_avg = max(0.0, 1.0 - (avg_q_len / max_tolerated_q))
-
     T = txRate / 100_000_000_000
+    L = 1 / max(0.000001, avg_q_len)
     # print(f'txRate: {txRate}, avg_q_len: {avg_q_len}, weighted txRate: {self.w * txRate}, weighted avg_q_len: {(1-self.w) * avg_q_len}')
     # print(f'T: {T}, D: {D}, weighted T: {self.w * T}, weighted D: {(1-self.w) * D}')
     # r = self.w * T + (1-self.w) * D
 
     # r = -avg_q_len
-    w = 0.4
-    r = w * T + w * Q_max + (1 - 2 * w) * Q_avg
+    w = 0.5
+    r = w * T + (1 - w) * L
     
 
     return {
@@ -151,12 +180,12 @@ def make_plots(w, alpha):
         plot_details = [
             {
                 "name": "throughput",
-                "title": "Throughput for static vs adaptive ECN thresholds",
+                "title": "Throughput for aggressive vs relaxed ECN parameters",
                 "y_axis_label": "Throughput (Bytes)"
             },
             {
                 "name": "queue_length",
-                "title": "Queue Length for static vs adaptive ECN thresholds",
+                "title": "Queue Length for aggressive vs relaxed ECN parameters",
                 "y_axis_label": "Queue Length (Bytes)"
             }, {
                 "name": "reward",
@@ -181,11 +210,13 @@ def make_plots(w, alpha):
             #     "y_axis_label": "n"
             # }
         ]
-
+        plt.rcParams.update({'font.size': axes_font_size})
         for detail in plot_details:
+            fig, ax = plt.subplots(figsize=(10,8))
             for i, item in enumerate(data):
                 # agent_data =  [list(x.values())[0][AGENT] for x in item["data"]]
-                agent_data =  [[(t, d[AGENT]) for t, d in x.items()][0] for x in item["data"][:end_idx]]
+                # print(json.dumps(item["data"], indent=4))
+                agent_data =  [[(t, d[AGENT][PORT]) for t, d in x.items()][0] for x in item["data"][:end_idx]]
                 times = [x[0] for x in agent_data]
 
                 calculated_data = {
@@ -207,23 +238,31 @@ def make_plots(w, alpha):
 
 
 
+                # Plot the results
+                
+
                 if detail['name'] == "thresholds":
-                    plt.plot(times, calculated_data[detail['name']]['k_min'], label=f'{item["label"]} - k_min', color=colours[i])
-                    plt.plot(times, calculated_data[detail['name']]['k_max'], label=f'{item["label"]} - k_max', color=colours[i])
+                    # print(f'{item["label"]}: {calculated_data[detail["name"]]["k_min"]}')
+                    # print(calculated_data[detail['name']]['k_max'])
+                    ax.plot(times, calculated_data[detail['name']]['k_min'], label=f'{item["label"]} - k_min', color=colours[i])
+                    ax.plot(times, calculated_data[detail['name']]['k_max'], label=f'{item["label"]} - k_max', color=colours[i])
                 elif detail['name'] == "acc_reward":
                     new_times = [x for x in range(0, len(calculated_data["reward"]), reward_steps)]
                     print(new_times)
-                    plt.plot(new_times, calculated_data[detail['name']], label=item['label'])
+                    ax.plot(new_times, calculated_data[detail['name']], label=item['label'])
                 else:
-                    plt.plot(times, calculated_data[detail['name']], label=item['label'])
+                    ax.plot(times, calculated_data[detail['name']], label=item['label'])
                 
 
-            plt.ylabel(detail["y_axis_label"])
-            plt.xlabel("Simulation Time (seconds)")
-            plt.legend()
-            plt.title(detail["title"]) # ECN thresholds with w=0.1 for reward=w * T + (1-w) * D(L)")#Queue Length with static ECN vs adaptive with ANN") # Reward with w=0.1 and r=w * T + (1-w) * D(L)")
-            plt.savefig(f'./{end_time}_{detail["name"]}_w_{w}_alpha_{alpha}_.png')
-            plt.cla()
+            ax.set_ylabel(detail["y_axis_label"])
+            ax.set_xlabel("Simulation Time (seconds)")
+            plt.rcParams.update({'font.size': legend_font_size})
+            ax.legend(frameon=False)
+            plt.rcParams.update({'font.size': axes_font_size})
+            # ax.set_title(detail["title"]) # ECN thresholds with w=0.1 for reward=w * T + (1-w) * D(L)")#Queue Length with static ECN vs adaptive with ANN") # Reward with w=0.1 and r=w * T + (1-w) * D(L)")
+            fig.tight_layout()
+            fig.savefig(f'./{end_time}_{detail["name"]}_w_{w}_alpha_{alpha}_.png')
+            plt.close(fig)
 
 def plot_D_component(w, alpha, data_item=None):
     if data_item:
@@ -271,13 +310,14 @@ def fmt_size(b):
 
 colours = ["orange", "blue", "green"]
 def plot_fcts(fcts):
+    plt.rcParams.update({'font.size': axes_font_size})
     fct_files = [x[0] for x in fcts]
     identifiers = [x[1] for x in fcts]
     plt.cla()
     PYTHON2_PATH = "/home/links/rl624/.conda/envs/hpcc_env/bin/python"
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(10,8))
 
-    ax.set_title("FCTs for Adaptive vs Static ECN parameters")
+    # ax.set_title("FCT slowdown for Agressive vs Relaxed Static ECN parameters")
 
     colour_idx = 0
     for idx, file in enumerate(fct_files):
@@ -315,24 +355,32 @@ def plot_fcts(fcts):
 
 
             ax.set_xlabel("Flow size")
-            ax.set_ylabel("FCT")
-            ax.legend()
+            ax.set_ylabel("FCT slowdown")
+            plt.rcParams.update({'font.size': legend_font_size})
+            ax.legend(frameon=False)
+            plt.rcParams.update({'font.size': axes_font_size})
             ax.set_xticks(steps,[fmt_size(size) for size in sizes], rotation=90)
+            
             # ax.set_xticklabels([fmt_size(size) for size in sizes])
 
             colour_idx += 1
-            
-        plt.savefig("fct_plot.png")
+        fig.tight_layout()
+        fig.savefig("fct_plot.png")
+        plt.close()
 
 
 w = 0.5
 alpha=40
 
 fcts = [
-    ("fct_star_5_web_search_5_80_0.1s_0", "Static ECN") # Static ECN
+    # ("fct_star_5_agressive_static", "Aggressive"), # Static ECN,
+    # ("fct_star_5_relaxed_static", "Relaxed")
+    ("fct_star_5_web_search_5_80_0.1s_0", "Static"),
+    ("fct_star_5_web_search_5_80_0.1s_1", "ANN")
 ]
 
-# plot_fcts(fcts)
+
+plot_fcts(fcts)
 
 # plot_D_component(w, alpha, data[0])
 make_plots(w, alpha)
