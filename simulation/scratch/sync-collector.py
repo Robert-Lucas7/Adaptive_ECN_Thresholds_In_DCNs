@@ -25,6 +25,7 @@ from torchrl.data import Binary, Bounded, LazyMemmapStorage, SliceSampler, Tenso
 from torchrl.envs import EnvBase, ExplorationType, set_exploration_type
 from torchrl.data import Composite
 from torchrl.collectors import SyncDataCollector
+from torch.distributions import Categorical
 from tqdm import tqdm
 import subprocess
 import os
@@ -37,8 +38,10 @@ from snntorch import spikegen
 # from torchinfo import summary
 import argparse
 import matplotlib.pyplot as plt
+import math
 
 from delta_modulator import DeltaModulator
+from rate_encoder import RateEncoder
 
 class OBS(Enum):
     BW = 0
@@ -52,6 +55,7 @@ class OBS(Enum):
 class ENCODING(Enum):
     DIRECT = 0
     DELTA = 1
+    RATE = 2
 
 # Create parser with description
 parser = argparse.ArgumentParser(description="RL parser")
@@ -64,6 +68,10 @@ parser.add_argument("--hidden_layers", type=int, default=1, help="Num hidden lay
 parser.add_argument("--hidden_neurons", type=int, default=64, help="Num hidden cells")
 parser.add_argument("--enc_in", type=str, default="direct", help="Encoding in - only for snn")
 parser.add_argument("--enc_out", type=str, default="direct", help="Encoding out - only for snn")
+parser.add_argument("--beta", type=float, default=0.8, help="Beta used in LIF neurons")
+parser.add_argument("--firing_rate", type=float, default=0.4, help="Firing rate to be used")
+parser.add_argument("--cont_or_disc", type=str, default="continuous", help="Continuous or discrete action space")
+parser.add_argument("--mse_loss_scale", type=float, default=20, help="Scaling for MSE Loss for direct encoding")
 
 # Optional argument
 parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed output")
@@ -76,6 +84,14 @@ NUM_HIDDEN_CELLS = args.hidden_neurons
 INPUT_ENCODING = ENCODING[args.enc_in.upper()]
 OUTPUT_ENCODING = ENCODING[args.enc_out.upper()]
 PERFORM_EVAL = args.eval
+SNN_BETA = args.beta
+FIRING_RATE = args.firing_rate
+CONT_OR_DISC = args.cont_or_disc.upper()
+MSE_LOSS_SCALING = args.mse_loss_scale
+
+if CONT_OR_DISC not in ["CONTINUOUS", "DISCRETE"]:
+    raise Exception("cont_or_disc must be either 'continuous' or 'discrete'.")
+
 
 NUM_AGENTS = 1 # 640 for 320 host fat tree
 NUM_PORTS = 256
@@ -109,8 +125,16 @@ print("==========================================")
 
 # TODO: align OUT_FEATURES and NUM_ACTIONS so that the output layers is only dependent on OUT_FEATURES (as hybrid encoding approaches may be taken).
 NUM_ACTIONS = 3
-OUT_FEATURES = 6
 NUM_STATE_PARAMS = 7
+
+# discrete action space for ECN parameters
+ACTION_BINS = [10, 10, 21]
+TOTAL_ACTION_COMBINATIONS = math.prod(ACTION_BINS)
+
+if CONT_OR_DISC == "CONTINUOUS":
+    OUT_FEATURES = 2 * NUM_ACTIONS
+else:
+    OUT_FEATURES = TOTAL_ACTION_COMBINATIONS
 
 
 # FRAMES_PER_BATCH = 1024
@@ -124,9 +148,13 @@ NUM_MINI_BATCHES = 4
 if NUM_DESIRED_SEQUENCES % NUM_MINI_BATCHES != 0:
     raise Exception("NUM_DESIRED_SEQUENCES must be divisible by NUM_MINI_BATCHES.")
 
+# Global vars to bypass torchrl's policy copies.
+FIRST_LAYER_SPIKING_AVERAGE = 0 
+FIRST_LAYERS_SPIKING_NUM_SAMPLES = 0
+
 class SNNNetwork(nn.Module):
     # TODO: Add a batch dimension so that parallel training is possible.
-    def __init__(self, num_hidden_layers, num_hidden, out_features, encoding_in, encoding_out, debug_eval = False):
+    def __init__(self, num_hidden_layers, num_hidden, out_features, encoding_in, encoding_out, beta, saved_models_suffix, virtual_timesteps,debug_eval = False):
         super().__init__()
 
         if encoding_out != ENCODING.DIRECT:
@@ -135,22 +163,35 @@ class SNNNetwork(nn.Module):
         self.encoding_in = encoding_in  # Enum
         
         # Set a dummy threshold - will adjust to more reasonable values after the first training run.
-        init_thresholds = torch.tensor([0.0000, 0.2759, 0.0673, 0.7518, 0.9891, 0.4962, 0.2], device='cuda:0')
-        
-        spike_density = 0.2
+        # These thresholds are close to suitable for 40% spike rate.
+        init_thresholds = torch.tensor([9.999999974752427e-07, 0.0024324641562998295, 0.000604943954385817, 0.002798483008518815, 0.3440958559513092, 0.35590702295303345, 0.42397502064704895], device='cuda:0')
+        window_size = 5000
+        if encoding_in == ENCODING.RATE:
+            self.virtual_timesteps = virtual_timesteps
+        else:
+            self.virtual_timesteps = 1
+
 
         self.delta_modulator = DeltaModulator(
             init_thresholds=init_thresholds,
             val_names=["bw","txRate","averageQLength","txRateECN","k_min","k_delta","p_max"],
-            learning_rate=0.1,
-            window_size=2000,  # Approximately update thresholds once every other batch.
-            spike_density=spike_density,
-            fix_thresholds=True
+            learning_rate=0.2,
+            window_size=5000,  # Approximately update thresholds once every 5 batches.
+            saved_models_suffix=saved_models_suffix,
+            spike_density=FIRING_RATE,
+            fix_thresholds=False
+        )
+
+        self.rate_encoder = RateEncoder( # window_size, virtual_timesteps, learning_rate, spike_rate
+            window_size=window_size,
+            virtual_timesteps=50,
+            learning_rate=0.2,
+            spike_rate=FIRING_RATE
         )
 
         # initialize layers
         self.num_hidden = num_hidden
-        BETA = 0.8  # N.B. to make this a learnable parameter, wrap in nn.Parameter
+        BETA = beta  # N.B. to make this a learnable parameter, wrap in nn.Parameter
         self.fc1 = nn.Linear(NUM_STATE_PARAMS, num_hidden)
 
         self.num_hidden_layers = num_hidden_layers
@@ -170,13 +211,25 @@ class SNNNetwork(nn.Module):
 
         self.debug_eval = debug_eval
         self.mem_potentials = []
-
-        self.first_layer_spiking_average = 0
-        self.first_layer_spiking_num_samples = 0
         # TODO: Check how "SNN for time-series analysis" used a linear readout.
 
+    # TODO: extend this to be an average across agents.
+    def reset_firing_rates(self):
+        global FIRST_LAYER_SPIKING_AVERAGE, FIRST_LAYERS_SPIKING_NUM_SAMPLES
+        FIRST_LAYER_SPIKING_AVERAGE = 0
+        FIRST_LAYERS_SPIKING_NUM_SAMPLES = 0
 
-    def forward(self, x, hidden_states, prev_obs, readout_states):
+    def track_firing_rates(self, spk):
+        global FIRST_LAYER_SPIKING_AVERAGE, FIRST_LAYERS_SPIKING_NUM_SAMPLES
+        if self.encoding_in == ENCODING.DIRECT:
+            sum_spks = spk.sum().item()
+            if sum_spks == 0:
+                print("SUM OF SPIKES IS 0")
+            FIRST_LAYER_SPIKING_AVERAGE += ((spk.mean().item()) - FIRST_LAYER_SPIKING_AVERAGE) / (FIRST_LAYERS_SPIKING_NUM_SAMPLES + 1)
+            FIRST_LAYERS_SPIKING_NUM_SAMPLES += 1
+
+    # TODO: rename delta_thresholds to something more suitable as it is used for both delta encoding and rate encoding.
+    def forward(self, x, mask, hidden_states, prev_obs, readout_states, delta_thresholds):
         if hidden_states is None:
             raise Exception("hidden_states shouldn't be None when using pytorch environment as a zeroed array is returned in _reset. If using SNNNetwork without rl environment, proceed.")
         
@@ -188,44 +241,61 @@ class SNNNetwork(nn.Module):
         
         if x.dim() < 4:  # x: [Port, Features]
             # Used for data/transition collection
-            cur, h, new_prev_obs, new_readout_states =  self.forward_step(x, mem, prev_obs, readout_states)
-            return cur, h, new_prev_obs, new_readout_states
+            cur, mask, h, new_prev_obs, new_readout_states, current_thresholds =  self.forward_step(x, mask, mem, prev_obs, readout_states)
+            return cur, mask, h, new_prev_obs, new_readout_states, current_thresholds
 
         else:  # x: [Sequence, Time, Port, Features]
             # Used when iterating over batches.
-            cur, h, new_prev_obs, new_readout_states = self.forward_sequences(x, mem, prev_obs, readout_states)
-            return cur, h, new_prev_obs, new_readout_states
+            cur, mask, h, new_prev_obs, new_readout_states, current_thresholds = self.forward_sequences(x, mask, mem, prev_obs, readout_states, delta_thresholds)
+            return cur, mask, h, new_prev_obs, new_readout_states, current_thresholds
 
-    def forward_step(self, x, mem, prev_obs, readout_states):
+    def forward_step(self, x, mask, mem, prev_obs, readout_states):
         """
         Used in the data collection phase where the collector processes individual transitions.
         """
         new_prev_obs = x.clone()
-        if self.encoding_in == ENCODING.DELTA:
-            x = self.delta_modulator.encode(x)
-            # print(f"Forward step: {x}", flush=True)
-
-        cur = self.fc1(x)
-
-        spk = None
-        # Loop through the layers up to the output layer.
-        for i in range(len(self.hidden_and_output_layers) - 1):
-            if i % 2 == 0:  # Spiking layer
-                mem_idx = i // 2  # As linear layers don't have a membrane potential - must index these separately.
-                # print(f'mem_layer shape: {mem[mem_idx, :].shape}, cur shape: {cur.shape}')
-                current_mem = mem[..., mem_idx, :]
-                spk, new_mem = self.hidden_and_output_layers[i](cur, current_mem)
-                if self.encoding_in == ENCODING.DIRECT:
-                    self.first_layer_spiking_average += ((spk.mean().item()) - self.first_layer_spiking_average) / (self.first_layer_spiking_num_samples + 1)
-                    self.first_layer_spiking_num_samples += 1
-
-                if self.debug_eval:
-                    print(f"Layer {mem_idx}, spikes: {spk.sum()}", flush=True)
-                mem[..., mem_idx, :] = new_mem
-            else:  # Linear layer
-                cur = self.hidden_and_output_layers[i](spk)
-
+        current_thresholds = None
         
+        if self.encoding_in == ENCODING.DELTA:
+            x = self.delta_modulator.encode(cur_vals=x, mask=mask)
+            # print(f"Forward step: {x}", flush=True)
+            # self.current_encoding_rate = x.abs().mean(dim=(0, 1))  # instantaneous spiking rate
+            current_thresholds = self.delta_modulator.thresholds.clone()
+        elif self.encoding_in == ENCODING.RATE:
+            # Add virtual timesteps to the last dimension of x.
+            x = self.rate_encoder.encode(x, mask)
+            current_thresholds = torch.zeros_like(x)
+            current_thresholds[0] = self.rate_encoder.scaling_factor
+
+
+        for vt in range(self.virtual_timesteps):
+            if INPUT_ENCODING == ENCODING.RATE:
+                in_data = x[vt, ...]
+            else:
+                in_data = x
+
+            cur = self.fc1(in_data)
+            encoding_layer_spikes = []
+            spk = None
+            # Loop through the layers up to the output layer.
+            for i in range(len(self.hidden_and_output_layers) - 1):
+                if i % 2 == 0:  # Spiking layer
+                    mem_idx = i // 2  # As linear layers don't have a membrane potential - must index these separately.
+                    # print(f'mem_layer shape: {mem[mem_idx, :].shape}, cur shape: {cur.shape}')
+                    current_mem = mem[..., mem_idx, :]
+                    spk, new_mem = self.hidden_and_output_layers[i](cur, current_mem)
+                    
+                    if i == 0:
+                        self.track_firing_rates(spk)
+                        encoding_layer_spikes.append(spk)
+
+                    if self.debug_eval:
+                        print(f"Layer {mem_idx}, spikes: {spk.sum()}", flush=True)
+                    mem[..., mem_idx, :] = new_mem
+                else:  # Linear layer
+                    cur = self.hidden_and_output_layers[i](spk)
+
+        self.current_encoding_rate = torch.stack(encoding_layer_spikes).mean()
         hidden_states = mem 
         # readout_states is the membrane potential of the output layer.
         _, new_readout_states = self.hidden_and_output_layers[-1](cur, readout_states)
@@ -233,9 +303,12 @@ class SNNNetwork(nn.Module):
         if self.debug_eval:
             print(f"Readout: {new_readout_states}", flush=True)
 
-        return new_readout_states, hidden_states, new_prev_obs, new_readout_states
+        if current_thresholds is None:
+            current_thresholds = torch.zeros_like(x)
 
-    def forward_sequences(self, x, hidden_states, prev_obs, readout_states):
+        return new_readout_states, mask, hidden_states, new_prev_obs, new_readout_states, current_thresholds
+
+    def forward_sequences(self, x, mask, hidden_states, prev_obs, readout_states, current_thresholds):
         """
         Used by the loss module for a batch of sequences.
         """
@@ -255,37 +328,51 @@ class SNNNetwork(nn.Module):
         # print(f"Shape of readout: {readout_states.shape}", flush=True)
         
         if self.encoding_in == ENCODING.DELTA:
-            # diff = continuous_x - prev_obs
-            
-            # # Generate the spikes (-1, 0, 1) manually exactly like in forward_step
-            # pos_spikes = (diff > self.DELTA_THRESHOLD).float()
-            # neg_spikes = (diff < -self.DELTA_THRESHOLD).float() * -1.0
-            
-            # x = pos_spikes + neg_spikes
-            x = self.delta_modulator.encode(continuous_x)
-            # print(f"Forward_sequences: {x}", flush=True)
+            x = self.delta_modulator.encode(continuous_x, mask, current_thresholds)
+        if self.encoding_in == ENCODING.RATE:
+            # A global scaling factor is used for rate coding - this is a single float value
+            # It has been saved as the first element of current_thresholds.
+            x = self.rate_encoder.encode(continuous_x, mask, current_thresholds[0])
 
+
+
+        encoding_layer_spikes = []
 
         all_cur = self.fc1(x)  # Linear layer only processes the last dimension of the input tensor (i.e. only the feature dimension is used here).
         # print(f'all_cur_shape: {all_cur.shape}')
         # print(f'x shape: {x.shape}')
-        # Loop over all layers up to the output layer
-        for t in range(x.size(1)):
-            cur = all_cur[:, t, ...]  # Outputs of the first linear layer for all sequences (fc1(obs)).
+        # Loop over all layers up to the output layer#
+        time_dim = 2 if self.encoding_in == ENCODING.RATE else 1
+        for t in range(x.size(time_dim)):
+            if self.encoding_in == ENCODING.RATE:
+                cur = all_cur[:, :, t, ...]  # Shape: [VT, Batch, Ports, Features]
+            else:
+                cur = all_cur[:, t, ...]  # Outputs of the first linear layer for all sequences (fc1(obs)).
 
-            for i in range(len(self.hidden_and_output_layers) - 1):
-                if i % 2 == 0:
-                    mem_idx = i // 2
-                    spk, new_mem = self.hidden_and_output_layers[i](cur, mem[..., mem_idx, :])
-                    # print(f'mem size: {mem.shape}, new_mem: {new_mem.shape}')
-                    mem[..., mem_idx, :] = new_mem
+            for vt in range(self.virtual_timesteps):
+                if self.encoding_in == ENCODING.RATE:
+                    cur_in = cur[vt, ...]    # Shape: [Batch, Ports, Features]
                 else:
-                    cur = self.hidden_and_output_layers[i](spk)
+                    cur_in = cur
 
-            _, new_readout = self.hidden_and_output_layers[-1](cur, readout_states)
-            readout_states = new_readout
+                for i in range(len(self.hidden_and_output_layers) - 1):
+                    if i % 2 == 0:
+                        mem_idx = i // 2
+                        spk, new_mem = self.hidden_and_output_layers[i](cur_in, mem[..., mem_idx, :])
+                        # print(f'mem size: {mem.shape}, new_mem: {new_mem.shape}')
+                        mem[..., mem_idx, :] = new_mem
 
+                        if i == 0:
+                            self.track_firing_rates(spk)
+                            encoding_layer_spikes.append(spk)
 
+                    else:
+                        cur_in = self.hidden_and_output_layers[i](spk)
+
+                _, new_readout = self.hidden_and_output_layers[-1](cur_in, readout_states)
+                readout_states = new_readout
+
+            self.current_encoding_rate = torch.stack(encoding_layer_spikes).mean()
             outputs.append(new_readout.clone())
             new_hidden_states.append(mem.clone())
             new_readout_states.append(new_readout.clone())
@@ -299,7 +386,7 @@ class SNNNetwork(nn.Module):
         new_prev_obs = continuous_x
         # new_hidden_states = mem
         # new_hidden_states = torch.stack(new_hidden_states, dim=1)
-        return outputs, new_hidden_states, new_prev_obs, new_readout_states
+        return outputs, mask, new_hidden_states, new_prev_obs, new_readout_states, current_thresholds
 
     def load_thresholds(self, path: str, batch_offset: int, agent_idx):
         """Load and update thresholds from file."""
@@ -376,7 +463,7 @@ class RLEnv(EnvBase):
 
         # ============ FOR Debugging ==============
         self.w = 0.5
-        self.alpha = 40
+        self.alpha = 4
         self.reward_history = [{
             "rewards": [],
             "q_lengths": [],
@@ -415,16 +502,35 @@ class RLEnv(EnvBase):
             device=self.device
         )
 
-        low = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=self.device).expand(*self.batch_size, self.max_active_ports, NUM_ACTIONS)
-        high = torch.tensor([1_000_000.0, 1_000_000.0, 1.0], dtype=torch.float32, device=self.device).expand(*self.batch_size, self.max_active_ports, NUM_ACTIONS)
+        if CONT_OR_DISC == "CONTINUOUS":
+            low = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=self.device).expand(*self.batch_size, self.max_active_ports, NUM_ACTIONS)
+            high = torch.tensor([1_000_000.0, 1_000_000.0, 1.0], dtype=torch.float32, device=self.device).expand(*self.batch_size, self.max_active_ports, NUM_ACTIONS)
 
-        self.action_spec = Bounded(
-            low=low,
-            high=high,  # Currently set max values of K_min and K_max to be the total buffer size.
-            shape=(*self.batch_size, self.max_active_ports, NUM_ACTIONS),
-            dtype=torch.float32,
-            device=self.device
-        )
+            self.action_spec = Bounded(
+                low=low,
+                high=high,  # Currently set max values of K_min and K_max to be the total buffer size.
+                shape=(*self.batch_size, self.max_active_ports, NUM_ACTIONS),
+                dtype=torch.float32,
+                device=self.device
+            )
+            max_k_min = high[0][0][0]
+            max_k_delta = high[0][0][1]
+            max_p_max = high[0][0][2]
+        else:
+            low = torch.tensor(0, dtype=torch.int64, device=self.device)
+            high = torch.tensor(839, dtype=torch.int64, device=self.device)
+
+            self.action_spec = Bounded(
+                low=low,
+                high=high, # Tells TorchRL the max values: [4, 10, 21]
+                shape=(*self.batch_size, self.max_active_ports), # 3 actions, NOT 35!
+                dtype=torch.int64, # Always use int64 for categorical actions in PyTorch
+                device=self.device
+            )
+            alpha = 4
+            max_k_min = alpha * 2^(ACTION_BINS[0]-1)
+            max_k_delta = alpha * 2^(ACTION_BINS[1]-1)
+            max_p_max = 1.0
         self.reward_spec = Unbounded(shape=(*self.batch_size, self.max_active_ports, 1), dtype=torch.float32, device=self.device)
 
         # self.add_truncated_keys()
@@ -443,9 +549,9 @@ class RLEnv(EnvBase):
             # 1e8,    # maxQLength
             1e11,   # txRateECN
             # N.B. This is normalised based on the buffer size - set to 32MB in NS3.
-            high[0][0][0],   # k_min  - N.B. all agents have the same high/upper bound values.
-            high[0][0][1],   # k_max
-            high[0][0][2]     # p_max
+            max_k_min,
+            max_k_delta,
+            max_p_max         # p_max
         ], dtype=torch.float32, device=self.device)
 
         self.last_obs = torch.zeros(*self.batch_size, self.max_active_ports, NUM_STATE_PARAMS, dtype=torch.float32, device=self.device)
@@ -593,9 +699,35 @@ class RLEnv(EnvBase):
                         if k_min == float('nan'):
                             raise Exception("Threshold is nan")
                     for j in range(self.max_active_ports):
-                        data.act.agents[i][j].k_min_out = actions[i, j, 0].item()
-                        data.act.agents[i][j].k_delta_out = actions[i, j, 1].item()
-                        data.act.agents[i][j].p_max_out = actions[i, j, 2].item()
+                        if CONT_OR_DISC == "CONTINUOUS":
+                            # The actions are simply the thresholds to use
+                            data.act.agents[i][j].k_min_out = actions[i, j, 0].item()
+                            data.act.agents[i][j].k_delta_out = actions[i, j, 1].item()
+                            data.act.agents[i][j].p_max_out = actions[i, j, 2].item()
+                        else:
+                            action_val = actions[i, j].item()
+                            # print(f"ACTION: {action_val}", flush=True)
+                            
+                            k_min_idx = action_val // (ACTION_BINS[1] * ACTION_BINS[2])
+                            remainder = action_val % (ACTION_BINS[1] * ACTION_BINS[2])
+                            
+                            k_delta_idx = remainder // ACTION_BINS[2]        # Extracts K_min (0-9)
+                            p_max_idx = remainder % ACTION_BINS[2] # Extracts P_max (0-20)
+
+                            alpha = 4 # A value of 4 sets the max value to be 2048 KB.
+                            # Calculate K_min: E(n) = 20 * 2^n (in KB) -> bytes
+                            k_min_val = alpha * (2.0 ** k_min_idx) * 1024.0 
+                            k_delta_val = alpha * (2.0 ** k_delta_idx) * 1024.0
+                            p_max_val = p_max_idx / 20.0
+
+                            # print(f"Action_val: {action_val}, K_min: {k_min_val}, K_delta: {k_delta_val}, P_max: {p_max_val}", flush=True)
+
+
+                            data.act.agents[i][j].k_min_out = k_min_val
+                            data.act.agents[i][j].k_delta_out = k_delta_val
+                            data.act.agents[i][j].p_max_out = p_max_val
+
+
 
                 new_obs = self.get_obs(data)
                 # print(f"New obs (in step) shape: {new_obs.shape}")
@@ -683,7 +815,8 @@ class RLEnv(EnvBase):
                 "mask": self.valid_mask.unsqueeze(-1),
                 "hidden_states": torch.zeros((*self.batch_size, self.max_active_ports, NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS), dtype=torch.float32, device=self.device),
                 "prev_obs": torch.zeros((*self.batch_size, self.max_active_ports, NUM_STATE_PARAMS), dtype=torch.float32, device=self.device),  # N.B. this is only used for delta modulation (temporal encoding) input.
-                "readout_states": torch.zeros((*self.batch_size, self.max_active_ports, OUT_FEATURES), dtype=torch.float32, device=self.device)
+                "readout_states": torch.zeros((*self.batch_size, self.max_active_ports, OUT_FEATURES), dtype=torch.float32, device=self.device),
+                "delta_thresholds": torch.zeros((*self.batch_size, self.max_active_ports, NUM_STATE_PARAMS), dtype=torch.float32, device=self.device)
             },
             batch_size=self.batch_size,
             device=self.device
@@ -784,18 +917,32 @@ device = (
 )
 env = RLEnv(None, device=device)
 env.reset()
-saved_models_suffix = f"{'snn' if USE_SNN else 'ann'}_{NUM_HIDDEN_LAYERS}_hidden_layers_{NUM_HIDDEN_CELLS}_hidden_cells_{INPUT_ENCODING.name}_{OUTPUT_ENCODING.name}"
+saved_models_suffix = f"{'snn' if USE_SNN else 'ann'}_{CONT_OR_DISC}_{NUM_HIDDEN_LAYERS}_hidden_layers_{NUM_HIDDEN_CELLS}_hidden_cells_{INPUT_ENCODING.name}_{OUTPUT_ENCODING.name}_BETA_{SNN_BETA}_FIRING_RATE_{FIRING_RATE}"
+if INPUT_ENCODING == ENCODING.DIRECT:
+    saved_models_suffix += f"_MSE_SCALING_{MSE_LOSS_SCALING}"
 
 def make_policy_module(agent_idx):
     actor_in_keys = ["observation"]
     if USE_SNN:
         print("Using SNN", flush=True)
-        actor_in_keys = ["observation", "hidden_states", "prev_obs", "readout_states"]
-        actor_out_keys = ["raw_output", ("next", "hidden_states"), ("next", "prev_obs"), ("next", "readout_states")]
-        actor_net = SNNNetwork(NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS, INPUT_ENCODING, OUTPUT_ENCODING, debug_eval=False)                
+        actor_in_keys = ["observation", "mask", "hidden_states", "prev_obs", "readout_states", "delta_thresholds"]
+        actor_out_keys = ["logits" if CONT_OR_DISC == "DISCRETE" else "raw_output", ("next", "mask"), ("next", "hidden_states"), ("next", "prev_obs"), ("next", "readout_states"),
+                          ("next", "delta_thresholds")]
+        # Virtual timesteps = 20
+        actor_net = SNNNetwork(
+            num_hidden_layers = NUM_HIDDEN_LAYERS, 
+            num_hidden = NUM_HIDDEN_CELLS, 
+            out_features = 2 * NUM_ACTIONS if CONT_OR_DISC == "CONTINUOUS" else TOTAL_ACTION_COMBINATIONS, 
+            encoding_in = INPUT_ENCODING, 
+            encoding_out = OUTPUT_ENCODING, 
+            beta = SNN_BETA, 
+            saved_models_suffix = saved_models_suffix, 
+            virtual_timesteps = 20, 
+            debug_eval=False
+        )                
     else:
         actor_in_keys = ["observation"]
-        actor_out_keys = ["raw_output"]
+        actor_out_keys = ["logits" if CONT_OR_DISC == "DISCRETE" else "raw_output"]
 
         hidden_layers = []
         for _ in range(NUM_HIDDEN_LAYERS):
@@ -806,27 +953,36 @@ def make_policy_module(agent_idx):
             nn.Linear(NUM_STATE_PARAMS, NUM_HIDDEN_CELLS),
             nn.ReLU(),
             *hidden_layers,
-            nn.Linear(NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS)
+            nn.Linear(NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS if CONT_OR_DISC == "CONTINUOUS" else TOTAL_ACTION_COMBINATIONS)
         )
 
     # summary(actor_net, input_size=(NUM_STATE_PARAMS,))
 
-    actor_module = TensorDictModule(
-        actor_net,
-        in_keys=actor_in_keys,
-        out_keys=actor_out_keys
-    )
+    if CONT_OR_DISC == "CONTINUOUS":
+        actor_module = TensorDictModule(
+            actor_net,
+            in_keys=actor_in_keys,
+            out_keys=actor_out_keys
+        )
 
-    extraction_module = TensorDictModule(
-        NormalParamExtractor(),
-        in_keys=["raw_output"],
-        out_keys=["loc", "scale"]
-    )
+        extraction_module = TensorDictModule(
+            NormalParamExtractor(),
+            in_keys=["raw_output"],
+            out_keys=["loc", "scale"]
+        )
 
-    policy_module = TensorDictSequential(
-        actor_module,
-        extraction_module
-    )
+        policy_module = TensorDictSequential(
+            actor_module,
+            extraction_module
+        )
+    else:
+        actor_module = TensorDictModule(
+            actor_net,
+            in_keys=actor_in_keys,
+            out_keys=actor_out_keys
+        )
+        policy_module = actor_module
+
 
     return policy_module
 
@@ -851,20 +1007,41 @@ def get_snn_net(policy):
     '''
     Utility function to make it easier if the structure of the ProbabilisticActor modules change.
     '''
-    return policy.module[0].module[0]
+    if CONT_OR_DISC == "CONTINUOUS":
+        return policy.module[0].module[0]
+    else:
+        # print(type(policy.module[0].module))
+        return policy.module[0].module
 
-local_policies = [ProbabilisticActor(
-    module=make_policy_module(i),
-    spec=env.action_spec[0],
-    in_keys=["loc", "scale"],
-    distribution_class=TanhNormal,
-    distribution_kwargs={  # Ensure the distributions are between the low and high
-        "low": env.action_spec[0].space.low, 
-        "high": env.action_spec[0].space.high,
-    },
-    return_log_prob=True,
-    # we'll need the log-prob for the numerator of the importance weights
-) for i in range(NUM_NETWORKS)]
+    # for module in policy.modules():
+    #     if isinstance(module, SNNNetwork):
+    #         return module
+        
+    # raise Exception("SNN not found")
+
+if CONT_OR_DISC == "CONTINUOUS":
+    local_policies = [ProbabilisticActor(
+        module=make_policy_module(i),
+        spec=env.action_spec[0],
+        in_keys=["loc", "scale"],
+        distribution_class=TanhNormal,
+        distribution_kwargs={  # Ensure the distributions are between the low and high
+            "low": env.action_spec[0].space.low, 
+            "high": env.action_spec[0].space.high,
+        },
+        return_log_prob=True,
+        # we'll need the log-prob for the numerator of the importance weights
+    ) for i in range(NUM_NETWORKS)]
+else:
+    local_policies = [ProbabilisticActor(
+        module=make_policy_module(i),
+        spec=env.action_spec[0],
+        in_keys=["logits"],
+        distribution_class=Categorical,
+        
+        return_log_prob=True,
+        # we'll need the log-prob for the numerator of the importance weights
+    ) for i in range(NUM_NETWORKS)]
 
 # If training was interrupted use this to load the previous models and continue the training.
 if BATCH_OFFSET != 0 or PERFORM_EVAL:
@@ -953,7 +1130,7 @@ loss_modules = [ClipPPOLoss(
 
 optims = [torch.optim.Adam(loss_modules[i].parameters(), lr) for i in range(NUM_NETWORKS)]
 
-BATCH_LIMIT = 300  # TODO: remove. This is temporary whilst the "reset sim" functionality does not work correctly - to end the training before the reset occurs (found empirically)
+BATCH_LIMIT = 200  # TODO: remove. This is temporary whilst the "reset sim" functionality does not work correctly - to end the training before the reset occurs (found empirically)
 
 total_training_frames = BATCH_LIMIT * NUM_DESIRED_SEQUENCES * SEQUENCE_LENGTH
 schedulers = [torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -965,7 +1142,7 @@ pbar = tqdm(total=TOTAL_FRAMES)
 eval_str = ""
 
 delta_modulation_thresholds = {}
-
+rate_encoding_scaling_factors = {}
 def align_input_tensors(td):
     """
     Make the done states have the same shape as the value and reward tensors. This is because
@@ -978,6 +1155,12 @@ def align_input_tensors(td):
     td["next", "truncated"] = td["next", "truncated"].unsqueeze(-1).expand_as(reward)
 
     return td
+
+# Reset average firing rates from env.reset()
+for i in range(NUM_AGENTS):
+    snn_net = get_snn_net(local_policies[i])
+    snn_net.reset_firing_rates()
+
 
 avg_firing_rates = []
 # DO TRAINING!
@@ -1076,12 +1259,36 @@ if not PERFORM_EVAL:
 
                     total_loss = masked_policy_loss + masked_value_loss + masked_entropy
 
+                    if INPUT_ENCODING == ENCODING.DIRECT:
+                        snn_net = get_snn_net(local_policies[agent_num])
+                        actual_rate = snn_net.current_encoding_rate 
+
+                        target_rate = torch.tensor(FIRING_RATE, device=device)
+
+                        rate_penalty = F.mse_loss(actual_rate, target_rate) 
+
+                        # print(f"RATE PENALTY: {rate_penalty}, other loss: {total_loss}")
+                        total_loss += MSE_LOSS_SCALING * rate_penalty
+
+                    if torch.isnan(total_loss):
+                        print(f"NaN loss at batch {batch_num}, epoch {epoch}, agent {agent_num}", flush=True)
+                        print(f"  loss_objective: {loss_vals['loss_objective']}", flush=True)
+                        print(f"  loss_critic: {loss_vals['loss_critic']}", flush=True)
+                        print(f"  loss_entropy: {loss_vals['loss_entropy']}", flush=True)
+
+                    
+
                     total_loss.backward()
 
                     # agent_num will always be 0 here when using MAPPO (as it iterates up to NUM_NETWORKS)
                     torch.nn.utils.clip_grad_norm_(loss_modules[agent_num].parameters(), max_grad_norm)
                     optims[agent_num].step()
                     optims[agent_num].zero_grad()
+
+                    for name, param in local_policies[agent_num].named_parameters():
+                        if torch.isnan(param).any():
+                            print(f"NaN weight in {name} at batch {batch_num}, epoch {epoch}, agent {agent_num}", flush=True)
+                            break
 
                     total_policy_loss += masked_policy_loss.item()
                     total_value_loss += masked_value_loss.item()
@@ -1090,29 +1297,9 @@ if not PERFORM_EVAL:
                     update_steps += 1
 
                     # ADD THESE CHECKS
-                    # if torch.isnan(loss_value):
-                    #     print(f"NaN loss at batch {batch_num}, epoch {epoch}, agent {agent_num}", flush=True)
-                    #     print(f"  loss_objective: {loss_vals['loss_objective']}", flush=True)
-                    #     print(f"  loss_critic: {loss_vals['loss_critic']}", flush=True)
-                    #     print(f"  loss_entropy: {loss_vals['loss_entropy']}", flush=True)
-                    # # Optimization: backward, grad clipping and optimization step
+                    
+                    # Optimization: backward, grad clipping and optimization step
                     # loss_value.backward()
-
-                    # grad_norm = torch.nn.utils.clip_grad_norm_(loss_modules[agent_num].parameters(), max_grad_norm)
-                    # if torch.isnan(grad_norm):
-                    #     print(f"NaN grad norm at batch {batch_num}, epoch {epoch}, agent {agent_num}", flush=True)
-
-                    # this is not strictly mandatory but it's good practice to keep
-                    # your gradient norm bounded
-                    # torch.nn.utils.clip_grad_norm_(loss_modules[agent_num].parameters(), max_grad_norm)
-                    # optims[agent_num].step()
-                    # optims[agent_num].zero_grad()
-
-                    # Check weights after update
-                    # for name, param in local_policies[agent_num].named_parameters():
-                    #     if torch.isnan(param).any():
-                    #         print(f"NaN weight in {name} at batch {batch_num}, epoch {epoch}, agent {agent_num}", flush=True)
-                    #         break
             # log losses here.
             avg_policy_loss = total_policy_loss / update_steps
             avg_value_loss = total_value_loss / update_steps
@@ -1126,27 +1313,25 @@ if not PERFORM_EVAL:
         
             # env.save_reward_history()
            
-        if batch_num % 5 == 0 and USE_SNN:
-            cur_firing_rates = {}
-            for agent_idx in range(NUM_AGENTS):
-                snn_net = get_snn_net(local_policies[agent_idx])
-                if snn_net.encoding_in == ENCODING.DIRECT:
-                    cur_firing_rates[agent_idx] = snn_net.first_layer_spiking_average
+        if USE_SNN:
+            if INPUT_ENCODING == ENCODING.DIRECT:
+                snn_net = get_snn_net(local_policies[0])
+                actual_rate = snn_net.current_encoding_rate 
+                print("THE ACTUAL RATE IS: ", actual_rate)
+                # avg_firing_rates.append(FIRST_LAYER_SPIKING_AVERAGE)
+                avg_firing_rates.append(actual_rate.cpu().detach().item())
 
-                    # Reset the spiking averages
-                    snn_net.first_layer_spiking_average = 0
-                    snn_net.first_layer_spiking_num_samples = 0
-                else:
-                    raise Exception("Average firing rates have not been implemented for other encoding schemes except direct encoding.")
-            avg_firing_rates.append(cur_firing_rates)
+                # Plotting the first agent's spiking rate for the first layer of direct encoding.
+                
+            elif INPUT_ENCODING == ENCODING.DELTA:
+                snn_net = get_snn_net(local_policies[0])
+                firing_rate_hist = snn_net.delta_modulator.spike_rate_hist
+                avg_firing_rates = firing_rate_hist
+            elif INPUT_ENCODING == ENCODING.RATE:
+                snn_net = get_snn_net(local_policies[0])
+                firing_rate_hist = snn_net.rate_encoder.spike_rate_hist
+                avg_firing_rates = firing_rate_hist
 
-            # Plotting the first agent's spiking rate for the first layer of direct encoding.
-            fig, ax = plt.subplots()
-            first_agent_firing_rates = [x[0] for x in avg_firing_rates]
-            print(f"Agent 0 firing rate: {first_agent_firing_rates[-1]}")
-            ax.plot(list(range(0, len(first_agent_firing_rates) * 5, 5)), first_agent_firing_rates)
-            fig.savefig(f'../firing_rates/direct_encoding_{saved_models_suffix}.png')
-            plt.close(fig)
 
 
         if batch_num % 10 == 0:
@@ -1172,58 +1357,120 @@ if not PERFORM_EVAL:
             ax.plot(entropy_loss)
             fig.savefig(f'../losses/entropy_loss_{saved_models_suffix}.png')
             plt.close(fig)
-            
-            # with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-            #     print("RUNNING EVAL ROLLOUT", flush=True)
-            #     eval_rollout = env.rollout(500, multi_agent_policy_module)
-            #     # ========== DEBUGGING =============
-            #     # Check for nan in actions and rewards
-            #     actions = eval_rollout["action"]
-            #     rewards = eval_rollout["next", "reward"]
-            #     print(f"NaN in actions: {torch.isnan(actions).any()}", flush=True)
-            #     print(f"NaN in rewards: {torch.isnan(rewards).any()}", flush=True)
-                
-            #     # Find the first step where nan appears
-            #     nan_steps = torch.isnan(actions).any(dim=-1).any(dim=0)  # shape: [steps]
-            #     if nan_steps.any():
-            #         first_nan_step = nan_steps.nonzero()[0].item()
-            #         print(f"First NaN action at step: {first_nan_step}", flush=True)
-            #         print(f"Action at step {first_nan_step}: {actions[:, first_nan_step]}", flush=True)
-            #         print(f"Observation at step {first_nan_step}: {eval_rollout['observation'][:, first_nan_step]}", flush=True)
-            #     # ===================================
 
-            #     print(eval_rollout, flush=True)
-            #     print(eval_rollout["next", "reward"], flush=True)
-            #     mean_reward = eval_rollout["next", "reward"].mean(dim=1)
-            #     q_lengths = eval_rollout["observation"][:, :, OBS.averageQLength.value]
-            #     mean_q_length = q_lengths.mean(dim=1)
-            #     print("MEAN REWARD: ", mean_reward, flush=True)
-            #     print("MEAN Q LENGTH: ", mean_q_length, flush=True)
-            #     for agent_num in range(NUM_AGENTS):
-            #         tracked_data[agent_num][i] = {
-            #             "mean_reward": mean_reward[agent_num].item(),
-            #             "mean_q_length": mean_q_length[agent_num].item()
-            #         }
-            #     print("TRACKED DATA: ", tracked_data, flush=True)
-
-            #     with open('../trained_models_data.txt', 'w') as f:
-            #         json.dump(tracked_data, f)
-
-                    # for agent_num in range(NUM_AGENTS):
-                    #     f.write(f"Agent {agent_num}:\n")
-                    #     for batch_num, data in tracked_data[agent_num].items():
-                    #         f.write(f"{batch_num},{data['mean_reward']},{data['mean_q_length']}\n")
+            with open(f'../saved_models_{saved_models_suffix}/loss_values.json', 'w') as f:
+                json.dump(loss_values, f)
                 
             for agent_num in range(NUM_NETWORKS):
                 torch.save(local_policies[agent_num].state_dict(), f'../saved_models_{saved_models_suffix}/agent_{agent_num}_batch_{i}_policy.pth')
             
-            if USE_SNN and INPUT_ENCODING == ENCODING.DELTA:
-                delta_modulation_thresholds[batch_num] = {
-                    agent_idx: get_snn_net(local_policies[agent_idx]).delta_modulator.thresholds.cpu().detach().tolist() for agent_idx in range(NUM_AGENTS)
-                }
-                
-                with open(f'../saved_models_{saved_models_suffix}/delta_thresholds.json', 'w') as f:
-                    json.dump(delta_modulation_thresholds, f)
+            if USE_SNN:
+                if INPUT_ENCODING == ENCODING.DELTA:
+                    for agent_idx in range(NUM_AGENTS):
+                        snn_net = get_snn_net(local_policies[agent_idx])
+                        
+                        hist = snn_net.delta_modulator.threshold_hist
+                        hist = [x.cpu().detach().tolist() for x in hist]
+
+                        delta_modulation_thresholds[agent_idx] = hist
+                    
+                    with open(f'../saved_models_{saved_models_suffix}/delta_thresholds.json', 'w') as f:
+                        json.dump(delta_modulation_thresholds, f)
+                    
+                    colours = ['b', 'r', 'g', 'orange', 'purple', 'teal', 'gold']
+                    fig, ax = plt.subplots()
+                    for i in range(NUM_STATE_PARAMS):
+                        ax.plot([x[i].cpu() for x in avg_firing_rates], label=f"Firing Rate {i}", color=colours[i])
+                    
+                    ax.set_xlabel("Threshold Updates")
+                    ax.set_ylabel("Firing Rate")
+                    fig.legend()
+                    fig.tight_layout()
+                    fig.savefig(f'../firing_rates/{saved_models_suffix}_individual.png')
+                    plt.close(fig)
+
+                    fig, ax = plt.subplots()
+
+                    ax.plot([sum(x.cpu()) / len(x.cpu()) for x in avg_firing_rates], label=f"Firing Rate", color='r')
+                    
+                    ax.set_xlabel("Threshold Updates")
+                    ax.set_ylabel("Average Firing Rate")
+                    fig.legend()
+                    fig.tight_layout()
+                    fig.savefig(f'../firing_rates/{saved_models_suffix}_collective.png')
+                    plt.close(fig)
+
+                    fig, ax = plt.subplots()
+                    for i in range(NUM_STATE_PARAMS):
+                        ax.plot([x[i].cpu() for x in delta_modulation_thresholds[0]], label=f"Threshold {i}", color=colours[i])
+                    
+                    ax.set_xlabel("Threshold Updates")
+                    ax.set_ylabel("Threshold Value")
+
+                    fig.legend()
+                    fig.tight_layout()
+                    fig.savefig(f'../firing_rates/{saved_models_suffix}_thresholds.png')
+                    plt.close(fig)
+
+
+                    avg_firing_rates = [x.cpu().detach().tolist() for x in avg_firing_rates]
+                elif INPUT_ENCODING == ENCODING.RATE:
+                    for agent_idx in range(NUM_AGENTS):
+                        snn_net = get_snn_net(local_policies[agent_idx])
+                        
+                        hist = snn_net.rate_encoder.scaling_factor_hist
+                        hist = [x.cpu().detach().tolist() for x in hist]
+
+                        rate_encoding_scaling_factors[agent_idx] = hist
+
+                    with open(f'../saved_models_{saved_models_suffix}/scaling_factors.json', 'w') as f:
+                        json.dump(rate_encoding_scaling_factors, f)
+
+                    fig, ax = plt.subplots()
+                    ax2 = ax.twinx()
+
+                    colours = ['b', 'r', 'g', 'orange', 'purple', 'teal', 'gold']
+                    for i in range(NUM_STATE_PARAMS):
+                        ax.plot([x[i].cpu() for x in avg_firing_rates], label=f"Firing Rate {i}", color=colours[i])
+                    
+                    ax2.plot(rate_encoding_scaling_factors[0], label=f"Scaling Factor {i}", color='black')
+                    
+                    ax.set_xlabel("Scaling Factor Updates")
+                    ax.set_ylabel("Firing Rate")
+                    ax2.set_ylabel("Scaling Factor")
+                    fig.legend()
+                    fig.tight_layout()
+                    fig.savefig(f'../firing_rates/{saved_models_suffix}_individual.png')
+                    plt.close(fig)
+
+                    fig, ax = plt.subplots()
+                    ax2 = ax.twinx()
+
+                    ax.plot([sum(x.cpu()) / len(x.cpu()) for x in avg_firing_rates], label=f"Average Firing Rate", color='r')
+                    
+                    # Agent 0
+                    ax2.plot(rate_encoding_scaling_factors[0], label=f"Scaling Factor", color='b')
+                    
+                    ax.set_xlabel("Scaling Factor Updates")
+                    ax.set_ylabel("Firing Rate")
+                    ax2.set_ylabel("Scaling Factor")
+                    fig.legend()
+                    fig.tight_layout()
+                    fig.savefig(f'../firing_rates/{saved_models_suffix}_singular.png')
+                    plt.close(fig)
+
+                    avg_firing_rates = [x.cpu().detach().tolist() for x in avg_firing_rates]
+                elif INPUT_ENCODING == ENCODING.DIRECT:
+                    fig, ax = plt.subplots()
+                    print(f"Agent 0 firing rate: {avg_firing_rates[-1]}")
+                    ax.plot(list(range(len(avg_firing_rates))), avg_firing_rates)
+                    fig.savefig(f'../firing_rates/direct_encoding_{saved_models_suffix}.png')
+                    plt.close(fig)
+                    # This is the firing rates of the encoding layer for direct encoding.
+                    # The firing rate before the input layer for delta and rate encoding.
+                with open(f'../saved_models_{saved_models_suffix}/firing_rates.json', 'w') as f:
+                    json.dump(avg_firing_rates, f)
+
 
     # with open('../../trained_models_data.txt', 'w') as f:
     #     for agent_num in range(NUM_AGENTS):
@@ -1234,9 +1481,21 @@ else:
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         print("RUNNING EVAL ROLLOUT", flush=True)
         # env.start_ns3_simulation()  # This will stop the previous simulation and start a new one.
+
+        if USE_SNN and INPUT_ENCODING == ENCODING.DIRECT:
+            for agent_idx in range(NUM_AGENTS):
+                snn_net = get_snn_net(local_policies[agent_idx])
+                FIRST_LAYERS_SPIKING_AVERAGE = 0
+                FIRST_LAYERS_SPIKING_NUM_SAMPLES = 0
+
         eval_rollout = env.rollout(10_000_000, multi_agent_policy_module) # Run until the simulation ends
         print("DONE ROLLOUT", flush=True)
         env.save_reward_history()
+
+        if USE_SNN and INPUT_ENCODING == ENCODING.DIRECT:
+            for agent_idx in range(NUM_AGENTS):
+                snn_net = get_snn_net(local_policies[agent_idx])
+                print(f"Agent {agent_idx} Overall Eval Firing Rate: {snn_net.current_encoding_rate}")
 
 
             
