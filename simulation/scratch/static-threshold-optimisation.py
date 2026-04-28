@@ -12,14 +12,15 @@ import json
 from utils import get_instantaneous_data, calculate_reward, get_total_pfc_pause
 
 class GA:
-    def __init__(self, pop_size, tournament_size, w):
+    def __init__(self, pop_size, tournament_size, w, trace, topo, sim_num, file):
+        self.file = file
         self.pop_size = pop_size
         self.tournament_size = tournament_size
         self.pm = 0.2
         self.pc = 0.8
         self.num_elites = 1
         self.num_generations = 10
-        self.results_fp = f"../static_ecn_ga_w_{str(w)}.txt"
+        self.results_fp = f"../static_threshold_optimisation/static_ecn_ga_{topo}_{trace}_w_{w}.txt"
 
         self.population = None
         self.population_fitness = None
@@ -34,18 +35,19 @@ class GA:
         self.w = w
         self.alpha = 40
 
-        self.trace_file = "60_incast_web_search_50_0.1s"
-        self.topo = "60_incast"
+        self.trace_file = trace
+        self.topo = topo
         self.sim_args = {
             "cc": "dcqcn",
             "bw": 100,
             "topo": self.topo,
             "trace": self.trace_file,
-            "w": str(w)
+            "w": str(w),
+            "sim_num": sim_num
         }
 
         # N.B. the relevant results file is located at: mix/instant_qlen_{topo}_{trace}_{cc}{failure}_{rl_ecn_marking}.txt
-        self.sim_results_file = f'mix/instant_qlen_{self.sim_args["topo"]}_{self.sim_args["trace"]}_{self.sim_args["cc"]}_0_{self.sim_args["w"]}.txt'
+        self.sim_results_file = f'mix/instant_qlen_{self.sim_args["topo"]}_{self.sim_args["trace"]}_{self.sim_args["cc"]}_0_{self.sim_args["w"]}__{0}.txt'
         self.run_history = []
         self.sim_cache = {}
 
@@ -70,13 +72,13 @@ class GA:
         args_str = [f'--{key}={value}' for key, value in args.items()]
         args_str.append("--perform_eval")  # N.B: This only sets 'simulator_stop_time' in 'third.cc' script.
 
-        subprocess.run([self.PYTHON2_PATH, "run.py", *args_str], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # This can be blocking as we need to wait for the whole simulation to run to get the average QLengths and throughput.
+        subprocess.run([self.PYTHON2_PATH, "run.py", *args_str], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # This can be blocking as we need to wait for the whole simulation to run to get the fct and pfc pause duration.
 
     def run(self):
-        self.population = [[random.randint(1, 2500), random.randint(1, 2500), random.uniform(0, 1)]
+        self.population = [[random.randint(1, 2000), random.randint(1, 2000), random.uniform(0, 1)]
                            for _ in range(self.pop_size)]
         run_stats = []
-        print("STARTING GA RUN...", flush=True)
+        print("STARTING GA RUN...", flush=True, file=self.file)
         for generation in range(self.num_generations):
             pop_fitness = []
 
@@ -84,18 +86,14 @@ class GA:
                 k_min = chromosome[0]
                 k_max = k_min + chromosome[1]
                 p_max = chromosome[2]
-                # print(f"{generation}:{i}", flush=True)
                 if (k_min, k_max, p_max) in self.sim_cache:
                     fitness = self.sim_cache[(k_min, k_max, p_max)]
-                    # print("HIT CACHE", flush=True)
                 else:
-                    # print("STARTING SIMULATION", flush=True)
                     self.start_ns3_simulation(k_min, k_max, p_max) # This is blocking - the fitness function simply reads the output file produced by the simulation.
                     fitness = self.get_fitness(chromosome)
                     self.sim_cache[(k_min, k_max, p_max)] = fitness
-                    # print("FINISHED SIMULATION", flush=True)
                 pop_fitness.append(fitness)
-                print(f"GEN: {generation}, CHROMOSOME: {i}, Values: {chromosome}, fitness: {fitness}", flush=True)
+                print(f"GEN: {generation}, CHROMOSOME: {i}, Values: {chromosome}, fitness: {fitness}", flush=True, file=self.file)
 
             self.population_fitness = pop_fitness
             
@@ -156,21 +154,6 @@ class GA:
         return parents, fitnesses
 
     def crossover(self, parent1, parent2, parent1_fitness, parent2_fitness):
-        # ============== Uniform crossover - not good for genetic diversity here ============
-        # if random.random() < self.pc:
-        #     # Create a random binary mask (equivalent to flipping a coin)
-        #     mask = [random.randint(0,1) for _ in range(len(parent1))] 
-        #     # If mask value is 1, use the gene from parent1, else use the gene from parent2
-        #     offspring = [parent1[i] if mask[i] == 1 else parent2[i] for i in range(len(mask))]
-        #     if offspring[0] > offspring[1]:
-        #         offspring[0], offspring[1] = offspring[1], offspring[0]
-        #     return offspring
-        # else:  # Return the 'better' parent so that the crossover operation always returns one solution.
-        #     if parent1_fitness > parent2_fitness:
-        #         return parent1
-        #     else:
-        #         return parent2
-
         if random.random() < self.pc:
             alpha = 0.5
             offspring = []
@@ -185,13 +168,6 @@ class GA:
             return parent1 if parent1_fitness >= parent2_fitness else parent2
 
     def get_fitness(self, chromosome):
-        # PORT = 1
-        # data = get_instantaneous_data(self.sim_results_file)
-        # print(f'got data with length: {len(data)}', flush=True)
-        # print(json.dumps(data[0], indent=4), flush=True)
-        # acc_reward = sum([calculate_reward(list(x.values())[0][PORT], self.w, self.alpha)["reward"] for x in data])
-        # print(f'acc_reward: {acc_reward}', flush=True)
-
         # Generate fct data by running script
         env = os.environ.copy()
         
@@ -202,7 +178,7 @@ class GA:
 
         chromosome_fct_fp = f"../analysis/ga_fct/{chromosome[0]}_{chromosome[1]}_{chromosome[2]}.txt"
         with open(chromosome_fct_fp, 'w') as f:
-            subprocess.run([self.PYTHON2_PATH, "../analysis/fct_analysis.py", "-p", f"fct_{self.topo}_{self.trace_file}_0"], env=env, stdout=f, stderr=f)
+            subprocess.run([self.PYTHON2_PATH, "../analysis/fct_analysis_single_depth.py", "-p", f"fct_{self.topo}_{self.trace_file}_0_{self.w}__0"], env=env, stdout=f, stderr=f)
         
         results = []
         with open(chromosome_fct_fp, 'r') as f:
@@ -217,21 +193,21 @@ class GA:
                 })
         # Data is already sorted based on flow size.
         top_n = 3
-        flow_w = 0.1
-        mice_99 = sum([x["fct_99"] for x in results[:top_n]])/top_n
-        elephant_mid = sum([x["fct_mid"] for x in results[-top_n:]]) / top_n
         
-        fct_score = flow_w * mice_99 + (1 - flow_w) * elephant_mid
+        mice_99 = sum([x["fct_99"] for x in results[:top_n]])/top_n
+        elephant_99 = sum([x["fct_99"] for x in results[-top_n:]]) / top_n
+        
+        fct_score = self.w * mice_99 + (1 - self.w) * elephant_99
 
-        pfc_fp = f"./mix/pfc_{self.topo}_{self.trace_file}_dcqcn.txt"
+        pfc_fp = f"./mix/pfc_{self.topo}_{self.trace_file}_{self.w}__0_dcqcn.txt"
         total_pause_ns = get_total_pfc_pause(pfc_fp)
         unacceptable_total_pause = 10_000_000  # ns = 10_000 us
         pfc_multiplier = 1/unacceptable_total_pause
 
         fitness = -(fct_score * (1 + pfc_multiplier * total_pause_ns))
 
-        print(f'fct_score: {fct_score}, mice_99: {mice_99}, elephant_mid: {elephant_mid}', flush=True)
-        print(f'total_pause_ns: {total_pause_ns}', flush=True)
+        print(f'fct_score: {fct_score}, mice_99: {mice_99}, elephant_mid: {elephant_99}', flush=True, file=self.file)
+        print(f'total_pause_ns: {total_pause_ns}', flush=True, file=self.file)
 
         return fitness # negative as a smaller value is better
     
@@ -245,32 +221,32 @@ class GA:
 import multiprocessing
 import sys
 
-def run_ga(w):
-    # with open(f'../static_ecn_optimisation_w_{str(w)}.txt', 'w') as log_file:
-    #     sys.stdout = log_file
-    #     sys.stderr = log_file
+def run_ga(w, trace, topo, sim_num):
     try:
-        ga = GA(pop_size=12, tournament_size=12, w=w)
-        best_solution = ga.run()
-        print(f"W: {w},BEST SOLUTION: {best_solution}", flush=True)
-        ga.write_stats()
+        with open(f"../static_threshold_optimisation/{topo}_{trace}_w_{w}.txt", "w") as f:
+            ga = GA(pop_size=12, tournament_size=2, w=w, trace=trace, topo=topo, sim_num=sim_num, file=f)
+            best_solution = ga.run()
+            print(f"W: {w},BEST SOLUTION: {best_solution}", flush=True, file=f)
+            ga.write_stats()
     except Exception as e:
         print(e, flush=True)
 
 
 if __name__ == "__main__":
     processes = []
-    # weights = [0.95, 0.96, 0.97, 0.98, 0.985, 0.99, 0.995]
-    weights = [0.5]  # Should work about 1:1 ratio for throughput to queue length.
+    weights = [0.3,0.4,0.5,0.6,0.7] 
+    
+    trace= "web_search_60_50_0.01s"
+    topo="60_incast"
+    sim_num = 0
+    sim_num_offset = 0
     for w in weights:
-        run_ga(w)
+        p = multiprocessing.Process(target=run_ga, args=(w,trace, topo,sim_num+sim_num_offset,), )
+        p.start()
+        processes.append(p)
+        sim_num += 1
     
-    # for w in weights:
-    #     p = multiprocessing.Process(target=run_ga, args=(w,), )
-    #     p.start()
-    #     processes.append(p)
-    
-    # for p in processes:
-    #     p.join()
+    for p in processes:
+        p.join()
 
 

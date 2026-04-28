@@ -101,7 +101,6 @@ unordered_map<uint64_t, double> rate2pmax;
 
 
 // ==================== My Changes - Robert Lucas ===========================
-// TODO: This should be experimented with in relation to the RTT (think it's mentioned in ACC paper that inference frequency should be an order of magnitude lower than RTT).
 int sim_num;
 string instant_qlen_mon_file;
 int rl_ecn_marking;
@@ -113,13 +112,12 @@ uint64_t instant_qlen_mon_interval = 1000;  // 20 microsecond interval - measure
 
 uint32_t agent_inference_interval = 41600; // One order of magnitude larger than the max RTT // 200 microseconds inference interval
 
-#define NUM_AGENTS 1  // Num end-hosts for incast, 640 for 320 host fat tree topo.
+#define NUM_AGENTS 56  // Num end-hosts for incast, 640 for 320 host fat tree topo.
 #define NUM_PORTS 256  // There are 256 ports per switch as the first network device is a loopback device.
 
 struct AgentEnv
 {
-	uint64_t BW;
-	double txRate;
+	double availableBW;
 	double averageQLength;
 	double txRateECN;
 	double k_min_in;
@@ -157,21 +155,16 @@ CommInterface::CommInterface(uint16_t id) : Ns3AIRL<Env, Act>(id)
 
 std::vector<std::vector<AgentAct>> CommInterface::getAct(std::vector<std::vector<AgentEnv>> *agentEnvs, std::vector<uint32_t> *activePorts)
 {
-	// std::cout << "TRYING TO COMMUNICATE WITH PYTHON" << std::endl;
-	// std::cout << "[C++] 1. Calling EnvSetterCond (Waiting for lock to write obs)..." << std::endl;
 	auto env = EnvSetterCond();
 	for (int i = 0; i < NUM_AGENTS; i++) {
 		for (int j = 0; j < NUM_PORTS; j++) {
 			env->agents[i][j] = (*agentEnvs)[i][j];
 		}
 		env->activePorts[i] = (*activePorts)[i];
-	}     ///< Acquire the Env memory for writing
+	} 
 
     SetCompleted(); 
 
-	// std::cout << "Sent observation, getting action" << std::endl;
-	
-	// std::cout << "[C++] 2. Obs written. Calling ActionGetterCond (Waiting for Python action)..." << std::endl;
     auto act = ActionGetterCond();  ///< Acquire the Act memory for reading
     std::vector<std::vector<AgentAct>> allECNParameters (NUM_AGENTS, std::vector<AgentAct>(NUM_PORTS));
 	for (int i = 0; i < NUM_AGENTS; i++) {
@@ -180,8 +173,6 @@ std::vector<std::vector<AgentAct>> CommInterface::getAct(std::vector<std::vector
 		}
 	}
     GetCompleted(); 
-	// std::cout << "Got action: "<< ecnParameters[0] << " " << ecnParameters[1] << " " << ecnParameters[2] << std::endl;
-	// std::cout << "[C++] 3. Action received! Returning control to ns-3." << std::endl;
     return allECNParameters;
 }
 
@@ -191,7 +182,6 @@ private:
 	// N.B. using 'm_' prefix to indicate that these are member attributes.
 	Ptr<SwitchNode> m_sw;
 	uint64_t m_lastTxs[NUM_PORTS];
-	// N.B. In sw->m_mmu, these are the data types for k_min, k_max, p_max. TODO: Check if k_min and k_max can be fully continuous (i.e. double as well)
 	uint32_t m_curKmins[NUM_PORTS], m_curKmaxs[NUM_PORTS], m_curKdeltas[NUM_PORTS];
 	double m_curPmaxs[NUM_PORTS];
 	
@@ -206,16 +196,12 @@ private:
 	Time m_lastTime;
 	uint64_t m_elapsedTime;
 	bool m_adaptive_ecn;
-	// uint32_t m_maxQLengths[NUM_PORTS];
 	uint16_t m_activePorts;
 
-
 	double getAverageDataOutputRate(int port);
-	
 	void UpdateArea(int port);
 	double GetAverageQueueLength(int port);
 	double getAverageECNMarkedOutputRate(int port);
-	
 
 public:
 	Agent(Ptr<SwitchNode> sw, bool adaptive_ecn);
@@ -243,7 +229,6 @@ Agent::Agent(Ptr<SwitchNode> sw, bool adaptive_ecn) : m_sw(sw) //, m_lastTx(sw->
 		m_curKdeltas[port] = m_curKmaxs[port] - m_curKmins[port];
 		m_curPmaxs[port] = sw->m_mmu->pmax[port+1];
 		
-		// m_maxQLengths[port] = 0;
 		m_txRateECN[port] = 0;
 		m_ecnBytesInWindow[port] = 0;
 		m_lastQlenEventTimes[port] = Simulator::Now();
@@ -270,7 +255,6 @@ Agent::Agent(Ptr<SwitchNode> sw, bool adaptive_ecn) : m_sw(sw) //, m_lastTx(sw->
 		Ptr<QbbNetDevice> qbbDev = DynamicCast<QbbNetDevice>(device);
 		
 		if (qbbDev) {
-			// N.B. This assumes that each link into the switch has the same bandwidth.
 			m_bandWidth = qbbDev->GetDataRate().GetBitRate();
 			
 			qbbDev->TraceConnectWithoutContext("QbbEnqueue", MakeBoundCallback(&Agent::TraceEnqueueStatic, this, i-1));
@@ -288,28 +272,19 @@ std::vector<AgentEnv> Agent::getState(){
 	// Returns the state of all ports on the switch.
 	std::vector<AgentEnv> allEnvs;
 
-	// Update the elapsed time from the previous call so that the averages are correct.
 	Time now = Simulator::Now();
     m_elapsedTime = (now - m_lastTime).GetNanoSeconds();
     m_lastTime = now;
 
 	for(int port=0;port< NUM_PORTS;port++){
-		// printf("getState: port=%d NUM_PORTS=%d\n", port, NUM_PORTS);
-		// if (port > 256) {
-		// 	NS_ABORT_MSG("Loop exceeded 256! port=" << port);
-		// }
 		AgentEnv env;
 		double txRate = getAverageDataOutputRate(port);  // bytes per seconds
 		double txRateECN = getAverageECNMarkedOutputRate(port);  // bytes per second
 		uint64_t bw = m_bandWidth;
 		double avgQLen = GetAverageQueueLength(port); // bytes per second
-		// double maxQLen = m_maxQLengths[port];
-		// m_maxQLengths[port] = 0;  // Reset m_maxQLength to 0.
-		// N.B. port is 1-indexed in this script, use 0-indexing in python so decrement this by 1 here.
-		env.BW = bw;
-		env.txRate = txRate;
+		
+		env.availableBW = bw - txRate;
 		env.averageQLength = avgQLen;
-		// env.maxQLength = maxQLen;
 		env.txRateECN = txRateECN;
 		env.k_min_in = m_curKmins[port];
 		//
@@ -332,8 +307,6 @@ void Agent::setECNParameters(std::vector<AgentAct> agentActs) {
 			m_curKmaxs[port] = m_curKmins[port] + m_curKdeltas[port];
 			m_curPmaxs[port] = curAct.p_max_out;
 
-			// std::cout << "k_min: " << m_curKmin << "k_max: " << m_curKmax << "p_max: " << m_curPmax << std::endl;
-
 			m_sw->m_mmu->ConfigEcn(port + 1, m_curKmins[port]/1000, m_curKmaxs[port]/1000, m_curPmaxs[port]);
 		}
 	}
@@ -347,7 +320,6 @@ double Agent::getAverageECNMarkedOutputRate(int port) {
 	if (windowDurationNs > 0) {
         m_txRateECN[port] = m_ecnBytesInWindow[port] / (windowDurationNs / 1000000000.0);
     }
-	// std::cout << "ECN BYTES: " << m_ecnBytesInWindow  << " Window size: " << windowDurationNs << std::endl;
     m_ecnBytesInWindow[port] = 0;
     m_ecnRateWindowStartTimes[port] = now;
 
@@ -356,24 +328,17 @@ double Agent::getAverageECNMarkedOutputRate(int port) {
 
 double Agent::getAverageDataOutputRate(int port) {
 	// port parameter is 0-indexed for arrays, actual ports in simulation are 1-index.
-
-	// m_txBytes[port] represents the cumulative number of bytes that have left the port for the 
-	// entire simulation so the difference between the value at the last inference is needed.
-
-	// std::cout << "CURRENT port: " << port << std::endl;
 	uint64_t curTxRate = m_sw->getTxBytes(port + 1);
 
 	uint64_t bytesSent = curTxRate - m_lastTxs[port];
 	m_lastTxs[port] = curTxRate;
-	double txRate = (bytesSent) / (m_elapsedTime / 1000000000.0);  // TODO: should this inference interval be measured, as assuming its not perfect timing.
+	double txRate = (bytesSent) / (m_elapsedTime / 1000000000.0);  
 	return txRate;
 }
 
 // Use a "weighted average" for the average Q length.
 double Agent::GetAverageQueueLength(int port) {
 	UpdateArea(port);
-
-    // 2. Calculate average (Total Byte-ns / Total Window-ns)
     Time now = Simulator::Now();
     int64_t windowDurationNs = (now - m_QlenWindowStartTimes[port]).GetNanoSeconds();
     
@@ -382,8 +347,6 @@ double Agent::GetAverageQueueLength(int port) {
         avgQ = m_qAreas[port] / windowDurationNs;
     }
 
-	// std::cout << windowDurationNs << " " << m_qArea << " " << avgQ << std::endl;
-
     m_qAreas[port] = 0;
     m_QlenWindowStartTimes[port] = now;
 
@@ -391,20 +354,12 @@ double Agent::GetAverageQueueLength(int port) {
 }
 
 void Agent::TraceEnqueue(uint32_t port, Ptr<const Packet> p, uint32_t priority) {
-	// printf("TraceDrop port=%u NUM_PORTS=%d\n", port, NUM_PORTS);
-    // NS_ABORT_MSG_IF(port >= NUM_PORTS, "TraceDrop out of bounds: " << port);
     UpdateArea(port);
 	
     m_currentQlens[port] += p->GetSize();
-
-	// if (m_currentQlens[port] > m_maxQLengths[port]) {
-	// 	m_maxQLengths[port] = m_currentQlens[port];
-	// }
 }
 
 void Agent::TraceDequeue(uint32_t port, Ptr<const Packet> p, uint32_t priority) {
-	// printf("TraceDrop port=%u NUM_PORTS=%d\n", port, NUM_PORTS);
-    // NS_ABORT_MSG_IF(port >= NUM_PORTS, "TraceDrop out of bounds: " << port);
     UpdateArea(port);
     if (m_currentQlens[port] >= p->GetSize()) {
 		m_currentQlens[port] -= p->GetSize();
@@ -415,11 +370,8 @@ void Agent::TraceDequeue(uint32_t port, Ptr<const Packet> p, uint32_t priority) 
 	Ptr<Packet> copy = p->Copy();
     EthernetHeader ethHeader;
     
-    // Remove the L2 header so the L3 (IP) header is at the front
     copy->RemoveHeader(ethHeader);
-
 	Ipv4Header ipHeader;
-    // We use PeekHeader because the packet is const
     if (copy->PeekHeader(ipHeader)) {
         // ECN_CE = 0x03 (Both bits set)
         if (static_cast<uint8_t>(ipHeader.GetEcn()) == 0x03) {  // Using 0x03 instead of EcnType::ECN_CE due to namespace issues.
@@ -429,8 +381,6 @@ void Agent::TraceDequeue(uint32_t port, Ptr<const Packet> p, uint32_t priority) 
 }
 
 void Agent::TraceDrop(uint32_t port, Ptr<const Packet> p, uint32_t priority) {
-	// printf("TraceDrop port=%u NUM_PORTS=%d\n", port, NUM_PORTS);
-    // NS_ABORT_MSG_IF(port >= NUM_PORTS, "TraceDrop out of bounds: " << port);
     UpdateArea(port);
     if (m_currentQlens[port] >= p->GetSize()) {
 		m_currentQlens[port] -= p->GetSize();
@@ -567,8 +517,8 @@ struct QlenDistribution{
 
 // =========================== My Changes - Robert Lucas ================
 map<uint64_t, std::vector<std::vector<AgentEnv>>> agentStates;
-bool writtenToFile = false;  // TODO: make this nicer (i.e. remove global variables and put all functionality into Agent).
-void write_state_to_file(FILE *output_file, std::vector<std::vector<AgentEnv>>* combinedEnv, std::vector<uint32_t> *activePorts) { //FILE *instantaneous_qlen_output, NodeContainer *n) { //, std::vector<Agent*> agents) {
+bool writtenToFile = false;  
+void write_state_to_file(FILE *output_file, std::vector<std::vector<AgentEnv>>* combinedEnv, std::vector<uint32_t> *activePorts) { 
 	agentStates[Simulator::Now().GetTimeStep()] = *combinedEnv;
 	
 	if (!writtenToFile && Simulator::Now().GetTimeStep() > instant_qlen_mon_end) {
@@ -581,7 +531,7 @@ void write_state_to_file(FILE *output_file, std::vector<std::vector<AgentEnv>>* 
 				fprintf(output_file, "Agent: %d\n", agentIndex);
 				for (int port = 0; port < activePorts->at(agentIndex); port++) {  // Loop over each port in agent
 					AgentEnv curPort = it2.at(port);
-					fprintf(output_file, "%lu %f %f %f %f %f %f\n", curPort.BW, curPort.txRate, curPort.averageQLength, curPort.txRateECN, curPort.k_min_in, curPort.k_delta_in, curPort.p_max_in);
+					fprintf(output_file, "%f %f %f %f %f %f\n", curPort.availableBW, curPort.averageQLength, curPort.txRateECN, curPort.k_min_in, curPort.k_delta_in, curPort.p_max_in);
 				}
 				agentIndex++;
 			}
@@ -592,19 +542,14 @@ void write_state_to_file(FILE *output_file, std::vector<std::vector<AgentEnv>>* 
 }
 
 
-// sw, j, &agent, agent_inference_interval);
 void UpdateECNParameters(vector<Agent*> agents, CommInterface* commInterface, FILE* instantaneous_qlen_output, NodeContainer* n) {
-	// std::cout << "REACHED UPDATE" << std::endl;
 	uint64_t t = Simulator::Now().GetTimeStep();
-	// std::cout << "\n[C++] Reached UpdateECNParameters at " << Simulator::Now().GetSeconds() 
-    //           << "s. Attempting to write to shared memory..." << std::endl;
 	std::vector<uint32_t> activePorts (NUM_AGENTS);
 	std::vector<std::vector<AgentEnv>> combinedEnv;  // This has a length of TOTAL_PORTS (NUM_AGENTS * NUM_PORTS)
 	for(int i=0;i < NUM_AGENTS; i++){
 		
 		combinedEnv.push_back(agents[i]->getState());
 		activePorts[i] = agents[i]->getNActivePorts();
-		// std::cout << "Retrieved agent state: " << i << " active ports: " << activePorts[i] << std::endl;
 	}
 
 	write_state_to_file(instantaneous_qlen_output, &combinedEnv, &activePorts);
@@ -616,10 +561,7 @@ void UpdateECNParameters(vector<Agent*> agents, CommInterface* commInterface, FI
 		}
 	}
 
-	// std::cout << "[C++] Successfully received action from Python!" << std::endl;
-
-	// std::cout << "In C++ Control loop" << std::endl;
-	if ((perform_eval == 1 && Simulator::Now().GetTimeStep() < instant_qlen_mon_end) || (perform_eval == 0 && Simulator::Now().GetTimeStep() < simulator_stop_time * 1000000000)) { // simulator_stop_time * 1000000000 ){ // simulator_stop_time * 1000000000) {
+	if ((perform_eval == 1 && Simulator::Now().GetTimeStep() < instant_qlen_mon_end) || (perform_eval == 0 && Simulator::Now().GetTimeStep() < simulator_stop_time * 1000000000)) { 
 		Simulator::Schedule(NanoSeconds(agent_inference_interval), &UpdateECNParameters, agents, commInterface, instantaneous_qlen_output, n);
 	} else {
 		std::cout << "TRAFFIC FINISHED STOPPING UPDATEECN"<< std::endl;
@@ -628,9 +570,7 @@ void UpdateECNParameters(vector<Agent*> agents, CommInterface* commInterface, FI
 
 uint64_t get_nic_rate(NodeContainer &n);
 
-// This has been directly taken from the Agent class
-// TODO: refactor this into the class to make it cleaner.
-// TODO: make this
+
 map<int, uint64_t> lastTx;  // mapping between port and txRate (bytes)
 // N.B. interval is in nanoseconds
 double getAverageDataOutputRate(Ptr<SwitchNode> m_sw, int m_port, uint32_t interval) {
@@ -645,93 +585,9 @@ double getAverageDataOutputRate(Ptr<SwitchNode> m_sw, int m_port, uint32_t inter
 	uint64_t bytesSent = curTxRateBytes - lastTx[m_port];
 	lastTx[m_port] = curTxRateBytes;
 	// N.B txRate is in bits per second.
-	double txRate = (bytesSent * 8) / (interval / 1000000000.0);  // TODO: should this inference interval be measured, as assuming its not perfect timing.
+	double txRate = (bytesSent * 8) / (interval / 1000000000.0);  
 	return txRate;
 }
-/*
-{
-	time: (QLenAndRate[2], txRate[num_ports])
-}
-*/
-
-/* struct AgentEnv
-{
-	uint64_t BW;
-	double txRate;
-	double averageQLength;
-	double txRateECN;
-	double k_min_in;
-	double k_delta_in;
-	double p_max_in;
-} Packed;*/
-
-	// std::vector<uint64_t> sendRate;
-	// std::vector<uint64_t> qlen;
-	// // std::cout << "MONITOR" << std::endl;
-	// // TODO: Make this work for multiple switches - line below - average txRate.
-	// std::vector<double> txRateVec;  // this stores the average data output rate of each port on the switch.
-	// for (uint32_t i = 0; i < n->GetN(); i++){
-	// 	if (n->Get(i)->GetNodeType() == 1){ // is switch
-	// 		Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n->Get(i));
-	// 		for (uint32_t j = 1; j < sw->GetNDevices(); j++){
-	// 			uint64_t total_queue_length = 0;
-
-				// for (uint32_t k = 0; k < SwitchMmu::qCnt; k++) {
-	// 				total_queue_length += sw->m_mmu->egress_bytes[j][k] * 8; // For Bps.  // N.B. This can be optimised as the only traffic should be priority 3.
-	// 			}
-	// 			qlen.push_back(total_queue_length);
-	// 			uint64_t total_sending_rate = 0;
-	// 			txRateVec.push_back(getAverageDataOutputRate(sw, j, instant_qlen_mon_interval));
-	// 		}
-
-	// 		// instantaneous_qlen[Simulator::Now().GetTimeStep()] = qlen;
-			
-	// 		// std::cout << "Queue length: " << qlen << " " << get_nic_rate(*n) << std::endl;  // Investigate how the "window size"/sending rate is affected by the traffic burst.
-	// 	} else if (n->Get(i)->GetNodeType() == 0) {
-	// 		Ptr<RdmaDriver> driver = n->Get(i)->GetObject<RdmaDriver>();
-	// 		if (driver) {
-	// 			Ptr<RdmaHw> hw = driver->m_rdma;
-
-	// 			// Iterate over each queue pair and sum their respective sending rates and sum.
-	// 			uint64_t total_sending_rate = 0;
-	// 			for (auto const& x : hw->m_qpMap) {
-	// 				Ptr<RdmaQueuePair> qp = x.second;
-	// 				if (qp) {
-	// 					total_sending_rate += qp->m_rate.GetBitRate();  // Get Sending rate in bytes
-	// 				}
-	// 			}
-	// 			sendRate.push_back(total_sending_rate);
-	// 		}
-	// 	}
-	// }
-	// std::tuple<std::vector<uint64_t>, std::vector<uint64_t>, std::vector<double>> trackingData;
-	// trackingData = make_tuple(qlen, sendRate, txRateVec);
-
-	// instantaneous_metrics[Simulator::Now().GetTimeStep()] = trackingData;
-
-	// if (Simulator::Now().GetTimeStep() < instant_qlen_mon_end) {
-	// 	// pass in here
-	// }
-	// 	// Simulator::Schedule(NanoSeconds(instant_qlen_mon_interval), &write_state_to_file, instantaneous_qlen_output, n);
-	// else {
-	// 	for (auto &it : instantaneous_metrics) {
-	// 		fprintf(instantaneous_qlen_output, "%u ", it.first);
-	// 		for (auto &it2 : get<0>(it.second)) {
-	// 			fprintf(instantaneous_qlen_output, "%u ", it2);
-	// 		}
-	// 		for (auto &it2 : get<1>(it.second)) {
-	// 			fprintf(instantaneous_qlen_output, "%u ", it2);
-	// 		}
-	// 		for (auto &it2 : get<2>(it.second)) {
-	// 			fprintf(instantaneous_qlen_output, "%f ", it2);
-	// 		}
-	// 		fprintf(instantaneous_qlen_output, "\n");
-	// 	}
-	// 	fflush(instantaneous_qlen_output);
-	// }
-	
-
-
 // ======================================================================
 
 map<uint32_t, map<uint32_t, QlenDistribution> > queue_result;
@@ -1401,10 +1257,9 @@ int main(int argc, char *argv[])
 	CommInterface* commInterface = nullptr;
 
 	if (rl_ecn_marking == 1){
+		std::cout << "[C++] Initialising memblock: " << 2333 + sim_num << std::endl;
 		uint16_t memblock_key = 2333 + sim_num;
-		uint16_t pool_id = 1234 + sim_num;
-		std::cout << "[C++] Initialising memblock with key: " << memblock_key << std::endl;
-		ns3::GlobalValue::Bind("SharedMemoryKey", ns3::UintegerValue(pool_id));
+		ns3::GlobalValue::Bind("SharedMemoryKey", ns3::UintegerValue(memblock_key));  // pool_id
 		ns3::GlobalValue::Bind("SharedMemoryPoolSize", ns3::UintegerValue(131072));
 		commInterface = new CommInterface(memblock_key);
 		std::cout << "[C++] Initialised memblock, waiting..." << std::endl;
@@ -1451,7 +1306,6 @@ int main(int argc, char *argv[])
 		}
 	}
 	// ================= My Changes =================
-	// if (rl_ecn_marking == 1) {
 	FILE* instantaneous_qlen_file = fopen(instant_qlen_mon_file.c_str(), "w");
 	Simulator::Schedule(Seconds(2), &UpdateECNParameters, switchAgents, commInterface, instantaneous_qlen_file, &n);
 	// }
@@ -1617,11 +1471,6 @@ int main(int argc, char *argv[])
 	FILE* qlen_output = fopen(qlen_mon_file.c_str(), "w");
 	Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output, &n);
 
-	// ======================================= My Changes - Robert Lucas =======================
-	// FILE* instantaneous_qlen_file = fopen(instant_qlen_mon_file.c_str(), "w");
-	// Simulator::Schedule(NanoSeconds(instant_qlen_mon_start), &monitor_instantaneous_qlen, instantaneous_qlen_file, &n);
-	// =========================================================================================
-
 	//
 	// Now, do the actual simulation.
 	//
@@ -1639,7 +1488,7 @@ int main(int argc, char *argv[])
 		commInterface->SetFinish();
 		delete commInterface;
 	}
-	for (Agent* a : switchAgents) { // Send signal to python script (the RL agent to finish).
+	for (Agent* a : switchAgents) {
 		delete a;
 	}
 	switchAgents.clear();

@@ -25,7 +25,7 @@ from torchrl.data import Binary, Bounded, LazyMemmapStorage, SliceSampler, Tenso
 from torchrl.envs import EnvBase, ExplorationType, set_exploration_type
 from torchrl.data import Composite
 from torchrl.collectors import SyncDataCollector
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Distribution
 from tqdm import tqdm
 import subprocess
 import os
@@ -35,7 +35,6 @@ import psutil
 import time
 import gc
 from snntorch import spikegen
-# from torchinfo import summary
 import argparse
 import matplotlib.pyplot as plt
 import math
@@ -44,8 +43,7 @@ from delta_modulator import DeltaModulator
 from rate_encoder import RateEncoder
 
 class OBS(Enum):
-    BW = 0
-    txRate = 1
+    availableBW = 0
     averageQLength = 2
     txRateECN = 3
     k_min_in = 4
@@ -57,10 +55,8 @@ class ENCODING(Enum):
     DELTA = 1
     RATE = 2
 
-# Create parser with description
 parser = argparse.ArgumentParser(description="RL parser")
 
-# TODO: use these arguments to name the saved_models directory and add a appropriate suffix.
 parser.add_argument("--network_type", type=str, default="ann", help="ANN or SNN")
 parser.add_argument("--eval", action="store_true", help="Eval mode")
 parser.add_argument("--batch_offset", type=int, default=0, help="Batch offset for eval")
@@ -72,10 +68,8 @@ parser.add_argument("--beta", type=float, default=0.8, help="Beta used in LIF ne
 parser.add_argument("--firing_rate", type=float, default=0.4, help="Firing rate to be used")
 parser.add_argument("--cont_or_disc", type=str, default="continuous", help="Continuous or discrete action space")
 parser.add_argument("--mse_loss_scale", type=float, default=20, help="Scaling for MSE Loss for direct encoding")
-
-# Optional argument
-parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed output")
-
+parser.add_argument("--sim_num", type=int, default=0, help="Sim number to run simultaneous trainings")
+parser.add_argument("--topo", type=str, default="star", help="Topology to use: star or fat")
 args = parser.parse_args()
 
 BATCH_OFFSET = args.batch_offset
@@ -88,13 +82,24 @@ SNN_BETA = args.beta
 FIRING_RATE = args.firing_rate
 CONT_OR_DISC = args.cont_or_disc.upper()
 MSE_LOSS_SCALING = args.mse_loss_scale
+SIM_NUM = args.sim_num
+TOPO = args.topo.upper()
+
+if TOPO == "STAR" or TOPO == "TESTING":
+    NUM_AGENTS = 1
+elif TOPO == "FAT":
+    NUM_AGENTS = 56  # This topology has 56 switches in a fat tree topology (spine-leaf topology)
+else:
+    raise Exception("topo must be either 'star', 'fat', or 'testing'.")
+
+
+print(f"SIM NUM = {SIM_NUM}", flush=True)
 
 if CONT_OR_DISC not in ["CONTINUOUS", "DISCRETE"]:
     raise Exception("cont_or_disc must be either 'continuous' or 'discrete'.")
 
-
-NUM_AGENTS = 1 # 640 for 320 host fat tree
 NUM_PORTS = 256
+MOMENTUM = 0.01
 
 if args.network_type.lower() == "snn":
     USE_SNN = True
@@ -102,8 +107,9 @@ else:
     USE_SNN = False
 
 USE_MAPPO = True
+
 if USE_MAPPO:
-    NUM_NETWORKS = 1  # Number of independent networks - using same networks for all agents for policy and value networks for MAPPO (as suggested in 'SurprisingEffectivenessOfPPO').
+    NUM_NETWORKS = 1  # Number of independent value networks - using same networks for all agents for value networks for MAPPO (as suggested in 'SurprisingEffectivenessOfPPO').
 else:
     NUM_NETWORKS = NUM_AGENTS
 
@@ -120,73 +126,110 @@ print(f"NUM_HIDDEN_LAYERS: {NUM_HIDDEN_LAYERS}", flush=True)
 print(f"NUM_HIDDEN_CELLS: {NUM_HIDDEN_CELLS}", flush=True)
 print("==========================================")
 
-
-# raise Exception("TESTING")
-
-# TODO: align OUT_FEATURES and NUM_ACTIONS so that the output layers is only dependent on OUT_FEATURES (as hybrid encoding approaches may be taken).
 NUM_ACTIONS = 3
-NUM_STATE_PARAMS = 7
+NUM_STATE_PARAMS = 6
 
 # discrete action space for ECN parameters
 ACTION_BINS = [10, 10, 21]
-TOTAL_ACTION_COMBINATIONS = math.prod(ACTION_BINS)
 
 if CONT_OR_DISC == "CONTINUOUS":
     OUT_FEATURES = 2 * NUM_ACTIONS
 else:
-    OUT_FEATURES = TOTAL_ACTION_COMBINATIONS
+    OUT_FEATURES = sum(ACTION_BINS)
 
+FIRST_LAYERS_SPIKING_AVERAGE = 0
+FIRST_LAYERS_SPIKING_NUM_SAMPLES = 0
 
-# FRAMES_PER_BATCH = 1024
 TOTAL_FRAMES = 12_000_000
 SEQUENCE_LENGTH = 16
 
 # N.B. NUM_DESIRED_SEQUENCES must be divisible by NUM_MINI_BATCHES.
-NUM_DESIRED_SEQUENCES = 64
-NUM_MINI_BATCHES = 4
+NUM_DESIRED_SEQUENCES = 8
+NUM_MINI_BATCHES = 2
 
 if NUM_DESIRED_SEQUENCES % NUM_MINI_BATCHES != 0:
     raise Exception("NUM_DESIRED_SEQUENCES must be divisible by NUM_MINI_BATCHES.")
 
-# Global vars to bypass torchrl's policy copies.
-FIRST_LAYER_SPIKING_AVERAGE = 0 
+FIRST_LAYERS_SPIKING_AVERAGE = 0 
 FIRST_LAYERS_SPIKING_NUM_SAMPLES = 0
 
-class SNNNetwork(nn.Module):
-    # TODO: Add a batch dimension so that parallel training is possible.
-    def __init__(self, num_hidden_layers, num_hidden, out_features, encoding_in, encoding_out, beta, saved_models_suffix, virtual_timesteps,debug_eval = False):
-        super().__init__()
+class SplitMultiCategorical(Distribution):
+    def __init__(self, logits):
+        # Split the flat tensor into three differently sized tensors
+        self.logits_split = torch.split(logits, ACTION_BINS, dim=-1)
+        
+        # Create 3 independent Categorical distributions
+        self.dists = [Categorical(logits=l) for l in self.logits_split]
 
+        batch_shape = logits.shape[:-1] 
+        event_shape = torch.Size([len(ACTION_BINS)])
+        super().__init__(batch_shape, event_shape)
+
+    def log_prob(self, value):
+        # value shape: [..., 3]
+        log_probs = []
+        for i, dist in enumerate(self.dists):
+            log_probs.append(dist.log_prob(value[..., i]))
+            
+        return torch.stack(log_probs, dim=-1).sum(dim=-1)
+
+    def entropy(self):
+        return sum([dist.entropy() for dist in self.dists])
+    
+    @property
+    def mode(self):
+        return torch.stack([dist.mode for dist in self.dists], dim=-1)
+    
+    @property
+    def mean(self):
+        return self.mode
+        
+    def sample(self, sample_shape=torch.Size()):
+        return torch.stack([dist.sample(sample_shape) for dist in self.dists], dim=-1)
+
+class SNNNetwork(nn.Module):
+    def __init__(self, num_hidden_layers, num_hidden, out_features, encoding_in, encoding_out, beta, saved_models_suffix, virtual_timesteps, device, debug_eval = False):
+        super().__init__()
+        self.device = device
         if encoding_out != ENCODING.DIRECT:
             raise Exception("Only Direct Encoding is currently supported for the output.")
 
         self.encoding_in = encoding_in  # Enum
         
-        # Set a dummy threshold - will adjust to more reasonable values after the first training run.
-        # These thresholds are close to suitable for 40% spike rate.
-        init_thresholds = torch.tensor([9.999999974752427e-07, 0.0024324641562998295, 0.000604943954385817, 0.002798483008518815, 0.3440958559513092, 0.35590702295303345, 0.42397502064704895], device='cuda:0')
+        init_thresholds = torch.zeros(NUM_STATE_PARAMS, device=device)
+        adaptive_threshold_mask = torch.tensor([1, 1, 1, 1, 1, 1], device=device)
+        if encoding_in == ENCODING.DELTA:
+            init_thresholds = torch.tensor([0.5] * 6, device=device)
+            
+        init_scaling_factor = 1
+        if encoding_in == ENCODING.RATE:
+            init_scaling_factor = torch.tensor([0.5] * 6, device=device)
+
         window_size = 5000
         if encoding_in == ENCODING.RATE:
             self.virtual_timesteps = virtual_timesteps
         else:
             self.virtual_timesteps = 1
 
-
         self.delta_modulator = DeltaModulator(
             init_thresholds=init_thresholds,
-            val_names=["bw","txRate","averageQLength","txRateECN","k_min","k_delta","p_max"],
+            val_names=["availableBW","averageQLength","txRateECN","k_min","k_delta","p_max"],
             learning_rate=0.2,
-            window_size=5000,  # Approximately update thresholds once every 5 batches.
+            window_size=window_size,  # Approximately update thresholds once every 5 batches.
             saved_models_suffix=saved_models_suffix,
+            device=device,
             spike_density=FIRING_RATE,
-            fix_thresholds=False
+            adaptive_threshold_mask=adaptive_threshold_mask
         )
 
-        self.rate_encoder = RateEncoder( # window_size, virtual_timesteps, learning_rate, spike_rate
+        self.rate_encoder = RateEncoder(
             window_size=window_size,
-            virtual_timesteps=50,
+            virtual_timesteps=self.virtual_timesteps,
             learning_rate=0.2,
-            spike_rate=FIRING_RATE
+            spike_rate=FIRING_RATE,
+            device=device,
+            scaling_factor=init_scaling_factor,
+            adaptive_sf_mask=torch.ones(NUM_STATE_PARAMS, device=device)
         )
 
         # initialize layers
@@ -211,25 +254,54 @@ class SNNNetwork(nn.Module):
 
         self.debug_eval = debug_eval
         self.mem_potentials = []
-        # TODO: Check how "SNN for time-series analysis" used a linear readout.
+        self.out_features = out_features
+        self.step_count = 0
 
-    # TODO: extend this to be an average across agents.
+        self.rolling_mean = None
+        self.rolling_variance = None
+        self.momentum = MOMENTUM
+
+        self.firing_rate_hist = []
+
     def reset_firing_rates(self):
-        global FIRST_LAYER_SPIKING_AVERAGE, FIRST_LAYERS_SPIKING_NUM_SAMPLES
-        FIRST_LAYER_SPIKING_AVERAGE = 0
+        global FIRST_LAYERS_SPIKING_AVERAGE, FIRST_LAYERS_SPIKING_NUM_SAMPLES
+        FIRST_LAYERS_SPIKING_AVERAGE = 0
         FIRST_LAYERS_SPIKING_NUM_SAMPLES = 0
 
     def track_firing_rates(self, spk):
-        global FIRST_LAYER_SPIKING_AVERAGE, FIRST_LAYERS_SPIKING_NUM_SAMPLES
+        global FIRST_LAYERS_SPIKING_AVERAGE, FIRST_LAYERS_SPIKING_NUM_SAMPLES
         if self.encoding_in == ENCODING.DIRECT:
             sum_spks = spk.sum().item()
-            if sum_spks == 0:
-                print("SUM OF SPIKES IS 0")
-            FIRST_LAYER_SPIKING_AVERAGE += ((spk.mean().item()) - FIRST_LAYER_SPIKING_AVERAGE) / (FIRST_LAYERS_SPIKING_NUM_SAMPLES + 1)
+
+            FIRST_LAYERS_SPIKING_AVERAGE = ((spk.mean().item() + FIRST_LAYERS_SPIKING_NUM_SAMPLES * FIRST_LAYERS_SPIKING_AVERAGE)) / (FIRST_LAYERS_SPIKING_NUM_SAMPLES + 1)
             FIRST_LAYERS_SPIKING_NUM_SAMPLES += 1
 
+    def normalise(self, x, update, mask, mean=None, std=None):
+        if update:
+            if self.rolling_mean is None and self.rolling_variance is None:
+                self.rolling_mean = x.clone()
+                self.rolling_variance = torch.ones_like(x)
+
+                return torch.zeros_like(x), self.rolling_mean, self.rolling_variance
+            else:
+                prev_mean = self.rolling_mean.clone()
+                self.rolling_mean = (1 - self.momentum) * self.rolling_mean + self.momentum * x
+                self.rolling_variance = (1 - self.momentum) * self.rolling_variance + self.momentum * (x - prev_mean) * (x - self.rolling_mean)
+                std_dev = torch.sqrt(self.rolling_variance + 1e-8)  # Prevent division by zero in next line.
+                x_norm = (x - self.rolling_mean) / std_dev
+
+                return x_norm, self.rolling_mean, std_dev
+        else:
+            if mean is None or std is None or mask is None:
+                raise Exception("Mean and std dev of rollout must be provided in forward_sequences")
+            
+            x_norm = (x - mean) / std
+            x_norm = x_norm * mask
+            return x_norm
+        
+
     # TODO: rename delta_thresholds to something more suitable as it is used for both delta encoding and rate encoding.
-    def forward(self, x, mask, hidden_states, prev_obs, readout_states, delta_thresholds):
+    def forward(self, x, mask, hidden_states, prev_obs, readout_states, delta_thresholds, means, stds):
         if hidden_states is None:
             raise Exception("hidden_states shouldn't be None when using pytorch environment as a zeroed array is returned in _reset. If using SNNNetwork without rl environment, proceed.")
         
@@ -240,14 +312,14 @@ class SNNNetwork(nn.Module):
 
         
         if x.dim() < 4:  # x: [Port, Features]
-            # Used for data/transition collection
-            cur, mask, h, new_prev_obs, new_readout_states, current_thresholds =  self.forward_step(x, mask, mem, prev_obs, readout_states)
-            return cur, mask, h, new_prev_obs, new_readout_states, current_thresholds
+            # used for data/transition collection
+            cur, mask, h, new_prev_obs, new_readout_states, current_thresholds, means, stds =  self.forward_step(x, mask, mem, prev_obs, readout_states)
+            return cur, mask, h, new_prev_obs, new_readout_states, current_thresholds, means, stds
 
         else:  # x: [Sequence, Time, Port, Features]
-            # Used when iterating over batches.
-            cur, mask, h, new_prev_obs, new_readout_states, current_thresholds = self.forward_sequences(x, mask, mem, prev_obs, readout_states, delta_thresholds)
-            return cur, mask, h, new_prev_obs, new_readout_states, current_thresholds
+            # used when training
+            cur, mask, h, new_prev_obs, new_readout_states, current_thresholds = self.forward_sequences(x, mask, mem, prev_obs, readout_states, delta_thresholds, means, stds)
+            return cur, mask, h, new_prev_obs, new_readout_states, current_thresholds, means, stds
 
     def forward_step(self, x, mask, mem, prev_obs, readout_states):
         """
@@ -255,17 +327,25 @@ class SNNNetwork(nn.Module):
         """
         new_prev_obs = x.clone()
         current_thresholds = None
-        
+
+        self.step_count += 1
+
+        mem = mem.clone()
+        readout_states = readout_states.clone()
+
         if self.encoding_in == ENCODING.DELTA:
+            x, means, stds = self.normalise(x, update=True, mask=mask)
             x = self.delta_modulator.encode(cur_vals=x, mask=mask)
-            # print(f"Forward step: {x}", flush=True)
-            # self.current_encoding_rate = x.abs().mean(dim=(0, 1))  # instantaneous spiking rate
             current_thresholds = self.delta_modulator.thresholds.clone()
         elif self.encoding_in == ENCODING.RATE:
-            # Add virtual timesteps to the last dimension of x.
+            x, means, stds = self.normalise(x, update=True, mask=mask)
+            x = torch.sigmoid(x) # Ensure the rate is positive by passing it through sigmoid.
             x = self.rate_encoder.encode(x, mask)
             current_thresholds = torch.zeros_like(x)
-            current_thresholds[0] = self.rate_encoder.scaling_factor
+            current_thresholds = self.rate_encoder.scaling_factors.clone()
+        elif self.encoding_in == ENCODING.DIRECT:
+            means = torch.zeros_like(x)
+            stds = torch.zeros_like(x)
 
 
         for vt in range(self.virtual_timesteps):
@@ -275,13 +355,12 @@ class SNNNetwork(nn.Module):
                 in_data = x
 
             cur = self.fc1(in_data)
-            encoding_layer_spikes = []
+            encoding_layer_spikes = []  # N.b. this is only used for direct encoding, which has 1 virtual timestep.
             spk = None
             # Loop through the layers up to the output layer.
             for i in range(len(self.hidden_and_output_layers) - 1):
                 if i % 2 == 0:  # Spiking layer
                     mem_idx = i // 2  # As linear layers don't have a membrane potential - must index these separately.
-                    # print(f'mem_layer shape: {mem[mem_idx, :].shape}, cur shape: {cur.shape}')
                     current_mem = mem[..., mem_idx, :]
                     spk, new_mem = self.hidden_and_output_layers[i](cur, current_mem)
                     
@@ -296,6 +375,8 @@ class SNNNetwork(nn.Module):
                     cur = self.hidden_and_output_layers[i](spk)
 
         self.current_encoding_rate = torch.stack(encoding_layer_spikes).mean()
+        self.firing_rate_hist.append(self.current_encoding_rate)
+
         hidden_states = mem 
         # readout_states is the membrane potential of the output layer.
         _, new_readout_states = self.hidden_and_output_layers[-1](cur, readout_states)
@@ -306,52 +387,49 @@ class SNNNetwork(nn.Module):
         if current_thresholds is None:
             current_thresholds = torch.zeros_like(x)
 
-        return new_readout_states, mask, hidden_states, new_prev_obs, new_readout_states, current_thresholds
+        return new_readout_states, mask, hidden_states, new_prev_obs, new_readout_states, current_thresholds, means, stds
 
-    def forward_sequences(self, x, mask, hidden_states, prev_obs, readout_states, current_thresholds):
+    def forward_sequences(self, x, mask, hidden_states, prev_obs, readout_states, current_thresholds, means, stds):
         """
         Used by the loss module for a batch of sequences.
         """
-        # TODO: This method needs to be fixed in order to work with an arbitrary number of hidden layers.
-        # x is a 2D tensor of padded sequences.
-        # mem is the hidden states (the membrane potential of the hidden layers)
-        
         continuous_x = x
-        outputs = []
-        new_hidden_states = []
-        new_prev_obs = []
-        new_readout_states = []
+        mem = hidden_states[:, 0, ...].clone()  # Only get the first hidden state as the others will be outdated.
+        readout_states = readout_states[:, 0, ...].clone()  # Only take the first readout_state as the subsequent ones in sequence will be determined from this initial one.
 
-        mem = hidden_states[:, 0, ...]  # Only get the first hidden state as the others will be outdated.
-        readout_states = readout_states[:, 0, ...]  # Only take the first readout_state as the subsequent ones will be determined from this initial one.
+        batch_size = x.size(0)
+        time_steps = x.size(1)
         
-        # print(f"Shape of readout: {readout_states.shape}", flush=True)
+        out_shape = (batch_size, time_steps) + readout_states.shape[1:]
+        mem_shape = (batch_size, time_steps) + mem.shape[1:]
+
+        outputs = torch.empty(out_shape, dtype=readout_states.dtype, device=x.device)
+        new_hidden_states = torch.empty(mem_shape, dtype=mem.dtype, device=x.device)
+        new_readout_states = torch.empty(out_shape, dtype=readout_states.dtype, device=x.device)
         
         if self.encoding_in == ENCODING.DELTA:
+            x = self.normalise(x, update=False, mean=means, std=stds, mask=mask)
             x = self.delta_modulator.encode(continuous_x, mask, current_thresholds)
         if self.encoding_in == ENCODING.RATE:
-            # A global scaling factor is used for rate coding - this is a single float value
-            # It has been saved as the first element of current_thresholds.
-            x = self.rate_encoder.encode(continuous_x, mask, current_thresholds[0])
-
+            x = self.normalise(x, update=False, mean=means, std=stds, mask=mask)
+            x = torch.sigmoid(x)
+            x = self.rate_encoder.encode(x, mask, current_thresholds[0])
 
 
         encoding_layer_spikes = []
 
-        all_cur = self.fc1(x)  # Linear layer only processes the last dimension of the input tensor (i.e. only the feature dimension is used here).
-        # print(f'all_cur_shape: {all_cur.shape}')
-        # print(f'x shape: {x.shape}')
-        # Loop over all layers up to the output layer#
+        all_cur = self.fc1(x)  # Linear layer only processes the last dimension of the input tensor (i.e. only the feature dimension is used here)
         time_dim = 2 if self.encoding_in == ENCODING.RATE else 1
         for t in range(x.size(time_dim)):
+            # Slice against time dimension - rate encoding has a virtual timesteps dimension, hence why it is done separately.
             if self.encoding_in == ENCODING.RATE:
-                cur = all_cur[:, :, t, ...]  # Shape: [VT, Batch, Ports, Features]
+                cur = all_cur[:, :, t, ...]  
             else:
-                cur = all_cur[:, t, ...]  # Outputs of the first linear layer for all sequences (fc1(obs)).
+                cur = all_cur[:, t, ...] 
 
             for vt in range(self.virtual_timesteps):
                 if self.encoding_in == ENCODING.RATE:
-                    cur_in = cur[vt, ...]    # Shape: [Batch, Ports, Features]
+                    cur_in = cur[vt, ...]
                 else:
                     cur_in = cur
 
@@ -359,13 +437,10 @@ class SNNNetwork(nn.Module):
                     if i % 2 == 0:
                         mem_idx = i // 2
                         spk, new_mem = self.hidden_and_output_layers[i](cur_in, mem[..., mem_idx, :])
-                        # print(f'mem size: {mem.shape}, new_mem: {new_mem.shape}')
                         mem[..., mem_idx, :] = new_mem
 
                         if i == 0:
-                            self.track_firing_rates(spk)
                             encoding_layer_spikes.append(spk)
-
                     else:
                         cur_in = self.hidden_and_output_layers[i](spk)
 
@@ -373,37 +448,31 @@ class SNNNetwork(nn.Module):
                 readout_states = new_readout
 
             self.current_encoding_rate = torch.stack(encoding_layer_spikes).mean()
-            outputs.append(new_readout.clone())
-            new_hidden_states.append(mem.clone())
-            new_readout_states.append(new_readout.clone())
-
-            # new_hidden_states.append(mem1)
-
-        outputs = torch.stack(outputs, dim = 1)
-        new_hidden_states = torch.stack(new_hidden_states, dim=1)
-        new_readout_states = torch.stack(new_readout_states, dim=1)
+            outputs[:, t, ...] = new_readout
+            new_hidden_states[:, t, ...] = mem
+            new_readout_states[:, t, ...] = new_readout
 
         new_prev_obs = continuous_x
-        # new_hidden_states = mem
-        # new_hidden_states = torch.stack(new_hidden_states, dim=1)
         return outputs, mask, new_hidden_states, new_prev_obs, new_readout_states, current_thresholds
 
     def load_thresholds(self, path: str, batch_offset: int, agent_idx):
         """Load and update thresholds from file."""
         with open(path, 'r') as f:
             thresholds = json.load(f)
-        # str(...) is used when indexing 'thresholds' as JSON only allows string keys which json.dump
-        # enforces when the thresholds are saved to file.
-        self.delta_modulator.thresholds = torch.tensor(thresholds[str(batch_offset)][str(agent_idx)], device="cuda:0")
+        # str() is needed as JSON requires keys to be strings.
+        self.delta_modulator.thresholds = torch.tensor(thresholds[str(agent_idx)][-1], device=self.device)
+
+    def load_scaling_factors(self, fp, agent_idx):
+        with open(fp, 'r') as f:
+            scaling_factors = json.load(f)
+        self.rate_encoder.scaling_factors = torch.tensor(scaling_factors[str(agent_idx)][-1], device=self.device)
 
     
 class AgentEnv(Structure):
     _pack_ = 1
     _fields_ = [
-        ("BW", c_uint64),
-        ("txRate", c_double),
+        ("availableBW", c_double),
         ("averageQLength", c_double),
-        # ("maxQLength", c_uint32),
         ("txRateECN", c_double),
         ("k_min_in", c_double),
         ("k_delta_in", c_double),
@@ -432,28 +501,41 @@ class Act(Structure):
     ]
 
 class RLEnv(EnvBase):
-    def __init__(self, rl_interface, device="cpu"):
-        self.batch_size = torch.Size([NUM_AGENTS]) # Number of simultaneous environments running.
+    def __init__(self, sim_num, rl_interface, device="cpu"):
+        self.batch_size = torch.Size([NUM_AGENTS])
         super().__init__(batch_size=self.batch_size, device=device)
-        # self.device = device
         self.rl = rl_interface
         self.python2_path = "/home/links/rl624/.conda/envs/hpcc_env/bin/python"
         
         self.pool_id = 1234
         self.rl_id = 2333
-        # self.cur_sim_num = 0
+        
+        if TOPO == "STAR":
+            topology = "60_incast"
+            trace = "web_search_60_50"
+        elif TOPO == "FAT":
+            topology = "fat"
+            trace = "web_search_fat_30"
+        elif TOPO == "TESTING":
+            topology = "star_5"
+            trace = "web_search_5_80"
+        else:
+            raise Exception("TOPO must be either 'star' or 'fat'.")
+        
         self.ns3_args = {
             "cc": "dcqcn",
             "bw": 100,  # NIC bandwidth
             "rl_ecn_marking": 1,
-             # "web_search_320_0.3_100s", # "web_search_5_80_3000s",  # star_5_single_burst_trace  web_search_5_80_100s
-            "topo": 'star_5', # "fat", # "star_5",
-            "sim_num": 0
+            "topo": topology, 
+            "sim_num": sim_num,
+            "encoding": args.enc_in.upper(),
+            "firing_rate": FIRING_RATE
         }
         if PERFORM_EVAL:
-            self.ns3_args["trace"] = 'web_search_5_80_0.1s'
+            self.ns3_args["trace"] = f'{trace}_0.01s'
         else:
-            self.ns3_args["trace"] = 'web_search_5_80_3000s'
+            self.ns3_args["trace"] = f'{trace}_100s'
+        
 
         self.sim_done = True # Flag to determine whether to start the ns3 simulation.
 
@@ -463,7 +545,7 @@ class RLEnv(EnvBase):
 
         # ============ FOR Debugging ==============
         self.w = 0.5
-        self.alpha = 4
+        self.alpha = 20
         self.reward_history = [{
             "rewards": [],
             "q_lengths": [],
@@ -508,7 +590,7 @@ class RLEnv(EnvBase):
 
             self.action_spec = Bounded(
                 low=low,
-                high=high,  # Currently set max values of K_min and K_max to be the total buffer size.
+                high=high,  
                 shape=(*self.batch_size, self.max_active_ports, NUM_ACTIONS),
                 dtype=torch.float32,
                 device=self.device
@@ -522,18 +604,17 @@ class RLEnv(EnvBase):
 
             self.action_spec = Bounded(
                 low=low,
-                high=high, # Tells TorchRL the max values: [4, 10, 21]
-                shape=(*self.batch_size, self.max_active_ports), # 3 actions, NOT 35!
-                dtype=torch.int64, # Always use int64 for categorical actions in PyTorch
+                high=high,
+                shape=(*self.batch_size, self.max_active_ports, 3), 
+                dtype=torch.int64,
                 device=self.device
             )
-            alpha = 4
+            alpha = 20
             max_k_min = alpha * 2^(ACTION_BINS[0]-1)
             max_k_delta = alpha * 2^(ACTION_BINS[1]-1)
             max_p_max = 1.0
         self.reward_spec = Unbounded(shape=(*self.batch_size, self.max_active_ports, 1), dtype=torch.float32, device=self.device)
 
-        # self.add_truncated_keys()
         self.done_spec = Composite(
             done=Binary(1, shape=(*self.batch_size, 1), dtype=torch.bool, device=self.device),
             terminated=Binary(1, shape=(*self.batch_size, 1), dtype=torch.bool, device=self.device),
@@ -543,15 +624,12 @@ class RLEnv(EnvBase):
         )
         # Very important scaling to prevent exploding gradients, producing 'nan' actions.
         self.OBS_SCALE = torch.tensor([
-            1e11/8.0,   # BW
-            1e11,   # txRate
+            1e11/8.0,   # availableBW - normalised by BW
             1e8,    # averageQLength
-            # 1e8,    # maxQLength
             1e11,   # txRateECN
-            # N.B. This is normalised based on the buffer size - set to 32MB in NS3.
             max_k_min,
             max_k_delta,
-            max_p_max         # p_max
+            max_p_max         
         ], dtype=torch.float32, device=self.device)
 
         self.last_obs = torch.zeros(*self.batch_size, self.max_active_ports, NUM_STATE_PARAMS, dtype=torch.float32, device=self.device)
@@ -560,7 +638,7 @@ class RLEnv(EnvBase):
         print("in set_mode")
         if mode.upper() == "EVAL":
             print("SETTING TRACE")
-            self.ns3_args["trace"] = "web_search_5_80_0.1s"
+            self.ns3_args["trace"] = "web_search_60_80_0.1s"
         else:
             pass
     
@@ -573,48 +651,23 @@ class RLEnv(EnvBase):
         """
         Start a new ns3 simulation. The previous simulation will be stopped before the new one is started.
         """
-        if self.ns3_process and self.ns3_process.poll() is None:
-                try:
-                    # TODO: document code
-                    parent = psutil.Process(self.ns3_process.pid)
-                    children = parent.children(recursive=True)
-                    for child in children:
-                        # print(f"Killing child: {child.pid} {child.name()}")
-                        child.kill()
-                    parent.kill()
-                    psutil.wait_procs(children)
-                    self.ns3_process.wait()
-                except psutil.NoSuchProcess:
-                    pass
-                
-                os.system("pkill -9 -f third_in_sync 2>/dev/null")
-                time.sleep(1)
-                # os.system("pkill -9 -f third_in_sync")
-                # os.system("pkill -9 -f waf")
-                # os.system("pkill -9 -f run.py")
-
-        print("Free Memory", flush=True)
-        py_interface.FreeMemory()
-
-        os.system("ipcs -m | awk '/rl624/ {print $2}' | xargs -r ipcrm -m 2>/dev/null")
-
-
-        print("Init", flush=True)
-        # print(f"isFinish before Init: {self.rl.isFinish()}", flush=True)
-        py_interface.Init(self.pool_id + self.ns3_args['sim_num'], 131072)
+        # Remove previous shared memory corresponding to the current shared memory key.
+        os.system(f"ipcrm -M {2333 + self.ns3_args['sim_num']} 2>/dev/null")
+        os.system(f"ipcrm -S {2333 + self.ns3_args['sim_num']} 2>/dev/null")
+        
+        print(f"[Python] Initialising shmkey: {self.rl_id + self.ns3_args['sim_num']}")
+        py_interface.Init(self.rl_id + self.ns3_args['sim_num'], 1040000) #131072)  # self.pool_id
 
         print("INITIALISED", flush=True)
+        print(f"AgentEnv: {sizeof(AgentEnv)}")   
+        print(f"AgentAct: {sizeof(AgentAct)}")   
+        print(f"Env:      {sizeof(Env)}")       
+        print(f"Act:      {sizeof(Act)}")        
+        print(f"Total:    {sizeof(Env) + sizeof(Act)}")
 
-        print(f"AgentEnv: {sizeof(AgentEnv)}")   # should be 60
-        print(f"AgentAct: {sizeof(AgentAct)}")   # should be 24
-        print(f"Env:      {sizeof(Env)}")        # should be 60*257 + 4 = 15424
-        print(f"Act:      {sizeof(Act)}")        # should be 24*257 = 6168
-        print(f"Total:    {sizeof(Env) + sizeof(Act)}")  # should be 21592
         self.rl = py_interface.Ns3AIRL(self.rl_id + self.ns3_args['sim_num'], Env, Act)
 
-        print("Ns3AIRL", flush=True)
         env = os.environ.copy()
-        # TODO: Make this cleaner and add logging, so it will be easier to debug.
         env["PATH"] = f"{os.path.dirname(self.python2_path)}:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin"
 
         for key in ["CONDA_PREFIX", "CONDA_DEFAULT_ENV", "CONDA_PYTHON_EXE", "PYTHON"]:
@@ -624,8 +677,7 @@ class RLEnv(EnvBase):
         if PERFORM_EVAL:
             args_str.append("--perform_eval")
 
-        self.ns3_process = subprocess.Popen([self.python2_path, "run.py", *args_str], env=env, text=True) #, preexec_fn=os.setsid) # stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
-        self.ns3_args['sim_num'] += 1
+        self.ns3_process = subprocess.Popen([self.python2_path, "run.py", *args_str], env=env, text=True)
 
     
     def get_obs(self, data):
@@ -633,9 +685,8 @@ class RLEnv(EnvBase):
         for agent_num in range(NUM_AGENTS):
             agent_data = []
             for port_num in range(self.max_active_ports):
-                agent_data.append([
-                    data.env.agents[agent_num][port_num].BW,            
-                    data.env.agents[agent_num][port_num].txRate, 
+                agent_data.append([            
+                    data.env.agents[agent_num][port_num].availableBW, 
                     data.env.agents[agent_num][port_num].averageQLength,
                     # data.env.agents[agent_num][port_num].maxQLength,
                     data.env.agents[agent_num][port_num].txRateECN,
@@ -646,30 +697,14 @@ class RLEnv(EnvBase):
             new_obs.append(agent_data)
 
         new_obs = torch.tensor(new_obs, device=self.device, dtype=torch.float32)
-
-        # print(f"NEW_OBS shape: {new_obs.shape}", flush=True)
-        # new_obs = new_obs.view(*self.batch_size, NUM_STATE_PARAMS)
-        # print(new_obs / self.OBS_SCALE)
         return new_obs / self.OBS_SCALE
 
 
-    def _step(self, td): # td = tensordict
-        # print(f"TENSORDICT SHAPE: {td.shape}")
-        # action = td["action"]
-        # TODO: Need to use the rl object to get the environment info from C++ here and then return control.
-        # This is where the communication with the ns3 simulation occurs.
-        actions = td["action"] # This has a shape of [Agent, Ports, Actions]
-
-        # print(f"In _step, actions shape: {actions.shape}", flush=True)
-        # Send action to NS3 simulation.
-        # print("SENDING ACTION")
+    def _step(self, td):
+        actions = td["action"]
 
         with self.rl as data:
             if data is None:
-                print("TRIGGERED", flush=True)
-                # done = torch.ones(*self.batch_size, dtype=torch.bool, device=self.device)
-                # new_obs = self.last_obs
-                # reward = torch.zeros(*self.batch_size, 1, dtype=torch.float32, device=self.device)
                 
                 self.sim_done = True
                 return TensorDict({
@@ -680,24 +715,8 @@ class RLEnv(EnvBase):
                     "truncated": torch.zeros(*self.batch_size, 1, dtype=torch.bool, device=self.device)
                 }, batch_size=self.batch_size, device=self.device)
             else:
-                # =========== DEBUGGING start_ns3_simulation =============
-                # print("SETTING done flag", flush=True)
-                # self.sim_done = True
-                # return TensorDict({
-                #     "observation": self.last_obs,
-                #     "reward": torch.zeros(*self.batch_size, 1, dtype=torch.float32, device=self.device),
-                #     "done": torch.ones(*self.batch_size, 1, dtype=torch.bool, device=self.device),
-                #     "terminated": torch.ones(*self.batch_size, 1, dtype=torch.bool, device=self.device),
-                #     "truncated": torch.zeros(*self.batch_size, 1, dtype=torch.bool, device=self.device)
-                # }, batch_size=self.batch_size, device=self.device)
-                # =========================================================
 
                 for i in range(NUM_AGENTS):
-                    if i == 1:
-                        # print(f'Python: k_min={actions[i, 0].item()}, k_max={actions[i, 0].item() + actions[i, 1].item()}, p_max={actions[i, 2].item()}', flush=True)
-                        k_min = actions[i, 0].item()
-                        if k_min == float('nan'):
-                            raise Exception("Threshold is nan")
                     for j in range(self.max_active_ports):
                         if CONT_OR_DISC == "CONTINUOUS":
                             # The actions are simply the thresholds to use
@@ -705,42 +724,29 @@ class RLEnv(EnvBase):
                             data.act.agents[i][j].k_delta_out = actions[i, j, 1].item()
                             data.act.agents[i][j].p_max_out = actions[i, j, 2].item()
                         else:
-                            action_val = actions[i, j].item()
-                            # print(f"ACTION: {action_val}", flush=True)
-                            
-                            k_min_idx = action_val // (ACTION_BINS[1] * ACTION_BINS[2])
-                            remainder = action_val % (ACTION_BINS[1] * ACTION_BINS[2])
-                            
-                            k_delta_idx = remainder // ACTION_BINS[2]        # Extracts K_min (0-9)
-                            p_max_idx = remainder % ACTION_BINS[2] # Extracts P_max (0-20)
+                            k_min_idx = actions[i, j, 0].item()
+                            k_delta_idx = actions[i, j, 1].item()
+                            p_max_idx = actions[i, j, 2].item()
 
-                            alpha = 4 # A value of 4 sets the max value to be 2048 KB.
-                            # Calculate K_min: E(n) = 20 * 2^n (in KB) -> bytes
+
+                            alpha = 20 
+                            # N.b. multiplied by 1024 as ACC uses KB as their queue length metric.
                             k_min_val = alpha * (2.0 ** k_min_idx) * 1024.0 
                             k_delta_val = alpha * (2.0 ** k_delta_idx) * 1024.0
                             p_max_val = p_max_idx / 20.0
-
-                            # print(f"Action_val: {action_val}, K_min: {k_min_val}, K_delta: {k_delta_val}, P_max: {p_max_val}", flush=True)
-
 
                             data.act.agents[i][j].k_min_out = k_min_val
                             data.act.agents[i][j].k_delta_out = k_delta_val
                             data.act.agents[i][j].p_max_out = p_max_val
 
-
-
                 new_obs = self.get_obs(data)
-                # print(f"New obs (in step) shape: {new_obs.shape}")
                 reward = self._calculate_reward(data.env).reshape(*self.batch_size, self.max_active_ports, 1)
-                # print(f"Reward shape: {reward.shape}", flush=True)
 
                 self.last_obs = new_obs
 
             truncated = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
             terminated = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
             done = truncated | terminated 
-
-            # print(new_obs)
 
             return TensorDict({
                 "observation": new_obs,
@@ -753,13 +759,11 @@ class RLEnv(EnvBase):
     def _reset(self, tensordict: TensorDictBase | None = None):
         
         if self.sim_done:
-            # TODO: probably need a way to kill the old process so that two simulations don't start running causes a problem with the shared memory.
             print("CALLING start_ns3_simulation", flush=True)
             self.start_ns3_simulation()
 
             print("STARTED ns3 simulation", flush=True)
             
-            # TODO: Research how do shared memory locks work properly.
             new_obs = None
             count =0 # FOR DEBUGGING
             while new_obs is None:
@@ -768,31 +772,25 @@ class RLEnv(EnvBase):
                 if count % 100 == 0:
                     print(f"STUCK in received first obs: count={count}, isFinish: {self.rl.isFinish()}", flush=True)
                 with self.rl as data:  # Calls rl.Acquire() and rl.ReleaseMemory() on __enter__ and __exit__ respectively.
+                    
+                    
                     if data is not None:
-                        if self.max_active_ports is None:
-                            self.max_active_ports = max(list(data.env.activePorts))
-                            # while self.max_active_ports == 0:
-                            #     self.max_active_ports = max(list(data.env.activePorts))
-                            #     time.sleep(0.01)
+                        cur_max_active_ports = max(list(data.env.activePorts))
+                        if cur_max_active_ports == 0:
+                            continue
+                        else:
+                            if self.max_active_ports is None:
+                                self.max_active_ports = cur_max_active_ports
 
-                                # print(f"Max active ports: {self.max_active_ports}", flush=True)
-                                # print(f"Active ports: {data.env.activePorts[0]}", flush=True)
+                                self.valid_mask = torch.zeros((NUM_AGENTS, self.max_active_ports), dtype=torch.bool, device=self.device)
+                                for i, active_count in enumerate(data.env.activePorts):
+                                    self.valid_mask[i, :active_count] = True
+                                
+                                self._build_specs()
 
-                            self.valid_mask = torch.zeros((NUM_AGENTS, self.max_active_ports), dtype=torch.bool, device=self.device)
-                            for i, active_count in enumerate(data.env.activePorts):
-                                self.valid_mask[i, :active_count] = True
-                            
-                            self._build_specs()
+                            new_obs = self.get_obs(data)
 
-
-                        new_obs = self.get_obs(data)
-
-                        # for i in range(NUM_AGENTS):
-                        #     data.act.agents[i].k_min_out = 1500
-                        #     data.act.agents[i].k_delta_out = 1500
-                        #     data.act.agents[i].p_max_out = 0.1
-
-                        print("RECEIVED FIRST obs", flush=True)
+                            print("RECEIVED FIRST obs", flush=True)
                     else:
                         print(f"Data is None! isFinish={self.rl.isFinish()}", flush=True)
                 count += 1
@@ -801,11 +799,6 @@ class RLEnv(EnvBase):
             print("Control back to python", flush=True)
             self.sim_done = False
         else:
-            # new_obs = torch.zeros(*self.batch_size, NUM_STATE_PARAMS, dtype=torch.float32, device=self.device)
-            # with self.rl as data:
-            #     if data is not None:
-            #         new_obs = self.get_obs(data)
-            #         print(f"New obs shape: {new_obs.shape}")
             new_obs = self.last_obs
         
        
@@ -816,7 +809,9 @@ class RLEnv(EnvBase):
                 "hidden_states": torch.zeros((*self.batch_size, self.max_active_ports, NUM_HIDDEN_LAYERS, NUM_HIDDEN_CELLS), dtype=torch.float32, device=self.device),
                 "prev_obs": torch.zeros((*self.batch_size, self.max_active_ports, NUM_STATE_PARAMS), dtype=torch.float32, device=self.device),  # N.B. this is only used for delta modulation (temporal encoding) input.
                 "readout_states": torch.zeros((*self.batch_size, self.max_active_ports, OUT_FEATURES), dtype=torch.float32, device=self.device),
-                "delta_thresholds": torch.zeros((*self.batch_size, self.max_active_ports, NUM_STATE_PARAMS), dtype=torch.float32, device=self.device)
+                "delta_thresholds": torch.zeros((*self.batch_size, self.max_active_ports, NUM_STATE_PARAMS), dtype=torch.float32, device=self.device),
+                "means": torch.zeros((*self.batch_size, self.max_active_ports, NUM_STATE_PARAMS), dtype=torch.float32, device=self.device),
+                "stds": torch.ones((*self.batch_size, self.max_active_ports, NUM_STATE_PARAMS), dtype=torch.float32, device=self.device)
             },
             batch_size=self.batch_size,
             device=self.device
@@ -829,12 +824,11 @@ class RLEnv(EnvBase):
         return seed + 1
 
     def _calculate_reward(self, env_data):
-        # reward = -avgQLength
         rewards = []
         for i in range(NUM_AGENTS):
             port_rewards = []
             for j in range(self.max_active_ports):
-                txRate = env_data.agents[i][j].txRate
+                availableBW = env_data.agents[i][j].availableBW
                 avg_q_len = env_data.agents[i][j].averageQLength
 
                 # Calculate min n, such that E(n) > L, E(n) = a * (2**n)
@@ -844,39 +838,16 @@ class RLEnv(EnvBase):
                     # N.B. divide by 1000 as alpha is set in the ACC paper based on the queue length in KB but avg_q_len is in bytes here.
                     if self.alpha * 2**n > (avg_q_len/1000):
                         break
+
                 D = 1 - n_power / 10
 
-                T = txRate / (100_000_000_000 / 8.0)
+                T = -availableBW / (100_000_000_000 / 8.0)
 
-                # TODO: need to find a way to normalise avg_q_len appropriately here!
-                L = 1 / max(0.0000001, avg_q_len)  # Avpod division by zero.
-                # print(f'txRate: {txRate}, avg_q_len: {avg_q_len}, weighted txRate: {self.w * txRate}, weighted avg_q_len: {(1-self.w) * avg_q_len}')
-                # print(f'T: {T}, D: {D}, weighted T: {self.w * T}, weighted D: {(1-self.w) * D}')
-                # r = self.w * T + (1-self.w) * D
-
-                # r = -avg_q_len
                 w = 0.5
                 r = w * T +(1 - w) * D
 
-                # if txRate < 10:
-                #     r -= 1000000000
                 port_rewards.append(r)
             rewards.append(port_rewards)
-
-            # ====== FOR DEBUGGING/ MONITORING =========
-            # self.reward_history[i]["rewards"].append(r)
-            # self.reward_history[i]["q_lengths"].append(avg_q_len)
-            # self.reward_history[i]["throughput"].append(txRate)
-            # # self.reward_history[i]["n"].append(n_power)
-            # self.reward_history[i]["T"].append(T)
-            # # self.reward_history[i]["D"].append(D)
-            # # TODO: Is this for the previous timestep?
-            # self.reward_history[i]["k_min"].append(env_data.agents[i].k_min_in)
-            # self.reward_history[i]["k_max"].append(env_data.agents[i].k_delta_in)
-            # self.reward_history[i]["p_max"].append(env_data.agents[i].p_max_in)
-
-            # if i == 0:
-            #     print(f"Agent {i}: txRate={txRate}, avg_q_len={avg_q_len}", flush=True)
 
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         return rewards
@@ -888,26 +859,18 @@ class MultiAgentPolicyWrapper(nn.Module):
         self.num_agents = num_agents
         self.policies = nn.ModuleList(local_policies)
 
-        if self.use_mappo and len(local_policies) > 1:
-            raise Exception("Only a shared policy can be used with MAPPO currently.")
-
     def forward(self, tensordict):
         output_tds = []
         
         for i in range(self.num_agents):
-            policy_idx = 0 if self.use_mappo else i
+            policy_idx = i# 0 if self.use_mappo else i
             out_td = self.policies[policy_idx](tensordict[i])
             output_tds.append(out_td)
             
         batched_output = torch.stack(output_tds, dim=0)
-        # print(f"Batched output shape: {batched_output.shape}", flush=True)
         tensordict.update(batched_output)
         
         return tensordict
-    
-
-# py_interface.Init(1234, 4096)
-# rl = py_interface.Ns3AIRL(2333, Env, Act)
 
 is_fork = multiprocessing.get_start_method() == "fork"
 device = (
@@ -915,29 +878,32 @@ device = (
     if torch.cuda.is_available() and not is_fork
     else torch.device("cpu")
 )
-env = RLEnv(None, device=device)
-env.reset()
-saved_models_suffix = f"{'snn' if USE_SNN else 'ann'}_{CONT_OR_DISC}_{NUM_HIDDEN_LAYERS}_hidden_layers_{NUM_HIDDEN_CELLS}_hidden_cells_{INPUT_ENCODING.name}_{OUTPUT_ENCODING.name}_BETA_{SNN_BETA}_FIRING_RATE_{FIRING_RATE}"
+env = RLEnv(SIM_NUM, None, device=device)
+initial_td = env.reset()
+saved_models_suffix = f"{TOPO}_{'snn' if USE_SNN else 'ann'}_{CONT_OR_DISC}_{NUM_HIDDEN_LAYERS}_hidden_layers_{NUM_HIDDEN_CELLS}_hidden_cells_{INPUT_ENCODING.name}_{OUTPUT_ENCODING.name}_BETA_{SNN_BETA}_FIRING_RATE_{FIRING_RATE}"
 if INPUT_ENCODING == ENCODING.DIRECT:
     saved_models_suffix += f"_MSE_SCALING_{MSE_LOSS_SCALING}"
+# elif INPUT_ENCODING == ENCODING.DELTA:
+#     saved_models_suffix += f"_telem_momentum_{MOMENTUM}"
 
 def make_policy_module(agent_idx):
     actor_in_keys = ["observation"]
     if USE_SNN:
-        print("Using SNN", flush=True)
-        actor_in_keys = ["observation", "mask", "hidden_states", "prev_obs", "readout_states", "delta_thresholds"]
+        # print("Using SNN", flush=True)
+        actor_in_keys = ["observation", "mask", "hidden_states", "prev_obs", "readout_states", "delta_thresholds", "means", "stds"]
         actor_out_keys = ["logits" if CONT_OR_DISC == "DISCRETE" else "raw_output", ("next", "mask"), ("next", "hidden_states"), ("next", "prev_obs"), ("next", "readout_states"),
-                          ("next", "delta_thresholds")]
-        # Virtual timesteps = 20
+                          ("next", "delta_thresholds"), ("next", "means"), ("next", "stds")]
+        
         actor_net = SNNNetwork(
             num_hidden_layers = NUM_HIDDEN_LAYERS, 
             num_hidden = NUM_HIDDEN_CELLS, 
-            out_features = 2 * NUM_ACTIONS if CONT_OR_DISC == "CONTINUOUS" else TOTAL_ACTION_COMBINATIONS, 
+            out_features = 2 * NUM_ACTIONS if CONT_OR_DISC == "CONTINUOUS" else OUT_FEATURES, 
             encoding_in = INPUT_ENCODING, 
             encoding_out = OUTPUT_ENCODING, 
             beta = SNN_BETA, 
             saved_models_suffix = saved_models_suffix, 
             virtual_timesteps = 20, 
+            device=device,
             debug_eval=False
         )                
     else:
@@ -953,10 +919,8 @@ def make_policy_module(agent_idx):
             nn.Linear(NUM_STATE_PARAMS, NUM_HIDDEN_CELLS),
             nn.ReLU(),
             *hidden_layers,
-            nn.Linear(NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS if CONT_OR_DISC == "CONTINUOUS" else TOTAL_ACTION_COMBINATIONS)
+            nn.Linear(NUM_HIDDEN_CELLS, 2 * NUM_ACTIONS if CONT_OR_DISC == "CONTINUOUS" else OUT_FEATURES)
         )
-
-    # summary(actor_net, input_size=(NUM_STATE_PARAMS,))
 
     if CONT_OR_DISC == "CONTINUOUS":
         actor_module = TensorDictModule(
@@ -983,21 +947,65 @@ def make_policy_module(agent_idx):
         )
         policy_module = actor_module
 
-
     return policy_module
 
-def make_value_module():
-    value_net = nn.Sequential(
-        nn.Linear(NUM_STATE_PARAMS, NUM_HIDDEN_CELLS),
-        nn.Tanh(),
-        nn.Linear(NUM_HIDDEN_CELLS, NUM_HIDDEN_CELLS),
-        nn.Tanh(),
-        nn.Linear(NUM_HIDDEN_CELLS, 1)
-    )
+def build_global_state(obs, mask):
+    masked_obs = obs * mask
+    target_shape = list(obs.shape)
+    target_shape[-1] = -1
+    
+    if obs.dim() == 3: 
+        universe = masked_obs.flatten()
+        return universe.unsqueeze(0).expand(NUM_AGENTS, -1)
+    elif obs.dim() == 4: 
+        time_steps = obs.shape[1]
+        obs_time_first = masked_obs.permute(1, 0, 2, 3)
+        universe_per_time = obs_time_first.flatten(start_dim=1)
+        return universe_per_time.unsqueeze(0).expand(NUM_AGENTS, time_steps, -1)
+    else:
+        raise ValueError(f"Unexpected observation dimension: {obs.shape}")
+
+class MAPPOValueNetwork(nn.Module):
+    def __init__(self, critic_input_dim, num_hidden_cells):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(critic_input_dim, num_hidden_cells),
+            nn.Tanh(),
+            nn.Linear(num_hidden_cells, num_hidden_cells),
+            nn.Tanh(),
+            nn.Linear(num_hidden_cells, 1)
+        )
+
+    def forward(self, local_obs, raw_global_state):
+        num_ports = local_obs.shape[-2]
+        expanded_global = raw_global_state.unsqueeze(-2)
+        target_shape = list(raw_global_state.shape)
+        target_shape.insert(-1, num_ports)
+        expanded_global = expanded_global.expand(*target_shape)
+        critic_in = torch.cat([local_obs, expanded_global], dim=-1)
+        return self.mlp(critic_in)
+
+def make_value_module(centralised, max_active_ports):
+    if centralised:
+        input_dim = NUM_STATE_PARAMS + NUM_STATE_PARAMS * NUM_AGENTS * max_active_ports
+        in_keys = ["observation", "raw_global_state"]
+        value_net = MAPPOValueNetwork(input_dim, NUM_HIDDEN_CELLS)
+    else:
+        input_dim = NUM_STATE_PARAMS
+        in_keys=["observation"]
+
+
+        value_net = nn.Sequential(
+            nn.Linear(input_dim, NUM_HIDDEN_CELLS),
+            nn.Tanh(),
+            nn.Linear(NUM_HIDDEN_CELLS, NUM_HIDDEN_CELLS),
+            nn.Tanh(),
+            nn.Linear(NUM_HIDDEN_CELLS, 1)
+        )
 
     value_module = ValueOperator(
         module=value_net,
-        in_keys=["observation"],
+        in_keys=in_keys,
     )
 
     return value_module
@@ -1010,14 +1018,7 @@ def get_snn_net(policy):
     if CONT_OR_DISC == "CONTINUOUS":
         return policy.module[0].module[0]
     else:
-        # print(type(policy.module[0].module))
         return policy.module[0].module
-
-    # for module in policy.modules():
-    #     if isinstance(module, SNNNetwork):
-    #         return module
-        
-    # raise Exception("SNN not found")
 
 if CONT_OR_DISC == "CONTINUOUS":
     local_policies = [ProbabilisticActor(
@@ -1025,29 +1026,26 @@ if CONT_OR_DISC == "CONTINUOUS":
         spec=env.action_spec[0],
         in_keys=["loc", "scale"],
         distribution_class=TanhNormal,
-        distribution_kwargs={  # Ensure the distributions are between the low and high
+        distribution_kwargs={ 
             "low": env.action_spec[0].space.low, 
             "high": env.action_spec[0].space.high,
         },
         return_log_prob=True,
-        # we'll need the log-prob for the numerator of the importance weights
-    ) for i in range(NUM_NETWORKS)]
+    ) for i in range(NUM_AGENTS)]
 else:
     local_policies = [ProbabilisticActor(
         module=make_policy_module(i),
         spec=env.action_spec[0],
         in_keys=["logits"],
-        distribution_class=Categorical,
+        distribution_class=SplitMultiCategorical, # Categorical,
         
         return_log_prob=True,
-        # we'll need the log-prob for the numerator of the importance weights
-    ) for i in range(NUM_NETWORKS)]
+    ) for i in range(NUM_AGENTS)]
 
 # If training was interrupted use this to load the previous models and continue the training.
 if BATCH_OFFSET != 0 or PERFORM_EVAL:
     for agent_num in range(NUM_AGENTS):
         print(f"Loading policy: {agent_num}", flush=True)
-        # TODO: how to load for MAPPO
         if USE_MAPPO:
             # All agents use the same learnt policy.
             loaded_state_dict = torch.load(f'../saved_models_{saved_models_suffix}/agent_0_batch_{BATCH_OFFSET}_policy.pth')
@@ -1055,18 +1053,20 @@ if BATCH_OFFSET != 0 or PERFORM_EVAL:
             loaded_state_dict = torch.load(f'../saved_models_{saved_models_suffix}/agent_{agent_num}_batch_{BATCH_OFFSET}_policy.pth')
         local_policies[agent_num].load_state_dict(loaded_state_dict)
 
-        if USE_SNN and INPUT_ENCODING == ENCODING.DELTA:
-            print(f'Loading agent {agent_num} thresholds', flush=True)
+        if USE_SNN:
             snn_net = get_snn_net(local_policies[agent_num])
-            snn_net.load_thresholds(f'../saved_models_{saved_models_suffix}/delta_thresholds.json', BATCH_OFFSET, agent_num)
+            if INPUT_ENCODING == ENCODING.DELTA:
+                print(f'Loading agent {agent_num} thresholds', flush=True)
+                snn_net.load_thresholds(f'../saved_models_{saved_models_suffix}/delta_thresholds.json', BATCH_OFFSET, agent_num)
+            elif INPUT_ENCODING == ENCODING.RATE:
+                print(f'Loading agent {agent_num} scaling factors', flush=True)
+                snn_net.load_scaling_factors(f'../saved_models_{saved_models_suffix}/scaling_factors.json', agent_num)
+            
 
 multi_agent_policy_module = MultiAgentPolicyWrapper(local_policies, use_mappo=USE_MAPPO, num_agents=NUM_AGENTS) # So each agent's policy can be executed in the same environment step.
 
 multi_agent_policy_module = multi_agent_policy_module.to(device)
-multi_agent_policy_module(env.reset())
-
-
-# frames_per_batch = 1024
+multi_agent_policy_module(initial_td)
 
 collector = SyncDataCollector(
     env,
@@ -1075,17 +1075,16 @@ collector = SyncDataCollector(
     total_frames=TOTAL_FRAMES,
     split_trajs=False,
     device=device,
-    # postproc=extract_collector_signals
 )
 
-lr = 3e-4
+lr = 1e-3 
 max_grad_norm = 1.0
 gamma = 0.99
 lmbda = 0.95
 
 
 samplers = [SliceSampler(
-    slice_len=SEQUENCE_LENGTH, # Sequence length of 16
+    slice_len=SEQUENCE_LENGTH,
     strict_length=True,
     cache_values=True,
     end_key=("next", "done"),
@@ -1093,23 +1092,29 @@ samplers = [SliceSampler(
 ) for _ in range(NUM_AGENTS)]
 
 replay_buffers = [TensorDictReplayBuffer(
-    storage=LazyMemmapStorage(max_size=10000),#LazyTensorStorage(max_size=frames_per_batch),
-    sampler=samplers[i],#SamplerWithoutReplacement(),
+    storage=LazyMemmapStorage(max_size=10000),
+    sampler=samplers[i],
     batch_size=(NUM_DESIRED_SEQUENCES * SEQUENCE_LENGTH) // NUM_MINI_BATCHES, # i.e. num_frames_per_batch / num_mini_batches = num_frames_per_mini_batch
 ) for i in range(NUM_AGENTS)]
 
-entropy_eps = 0.001 # 1e-4
+entropy_eps = 0.001
 clip_epsilon = (
-    0.2  # clip value for PPO loss: see the equation in the intro for more context.
+    0.2  
 )
 
 loss_critic_coeff = 1.0
 loss_entropy_coeff = entropy_eps
 
-value_modules = [make_value_module() for _ in range(NUM_NETWORKS)]
+with torch.no_grad():
+    global_state = build_global_state(initial_td["observation"], initial_td["mask"])
+    print(f"Expanded global state: {global_state.shape}", flush=True)
+    initial_td['raw_global_state'] = global_state
+
+
+value_modules = [make_value_module(USE_MAPPO, env.max_active_ports) for _ in range(NUM_NETWORKS)]
 for i in range(NUM_NETWORKS):
     value_modules[i] = value_modules[i].to(device)
-    value_modules[i](env.reset())
+    value_modules[i](initial_td)
 
 
 advantage_modules = [GAE(
@@ -1118,24 +1123,24 @@ advantage_modules = [GAE(
 
 loss_modules = [ClipPPOLoss(
     actor_network=local_policies[i],
-    critic_network=value_modules[i],  # TODO: Does this need to be for individual agents (similar to local_policies[i] above)
+    critic_network=value_modules[0],
     clip_epsilon=clip_epsilon,
     entropy_bonus=bool(entropy_eps),
     entropy_coeff=entropy_eps,
-    # these keys match by default but we set this for completeness
     critic_coeff=1.0,
     loss_critic_type="smooth_l1",
-    reduction="none"
-) for i in range(NUM_NETWORKS)]
+    reduction="none",
+    normalize_advantage=False
+) for i in range(NUM_AGENTS)]
 
-optims = [torch.optim.Adam(loss_modules[i].parameters(), lr) for i in range(NUM_NETWORKS)]
+optims = [torch.optim.Adam(loss_modules[i].parameters(), lr) for i in range(NUM_AGENTS)]
 
-BATCH_LIMIT = 200  # TODO: remove. This is temporary whilst the "reset sim" functionality does not work correctly - to end the training before the reset occurs (found empirically)
+BATCH_LIMIT = 150
 
 total_training_frames = BATCH_LIMIT * NUM_DESIRED_SEQUENCES * SEQUENCE_LENGTH
 schedulers = [torch.optim.lr_scheduler.CosineAnnealingLR(
     optims[i], total_training_frames // (NUM_DESIRED_SEQUENCES * SEQUENCE_LENGTH), 0.0
-) for i in range(NUM_NETWORKS)]
+) for i in range(NUM_AGENTS)]
 
 logs = defaultdict(list)
 pbar = tqdm(total=TOTAL_FRAMES)
@@ -1188,39 +1193,32 @@ if not PERFORM_EVAL:
         all_agents_data = []
         
         if USE_MAPPO:
-            for agent_num in range(NUM_AGENTS):
-                agent_data = tensordict_data[agent_num]
-        
-                # (Optional) Store in buffer
-                replay_buffers[agent_num].extend(agent_data)
-                
-                agent_data = agent_data.view(NUM_DESIRED_SEQUENCES, SEQUENCE_LENGTH)
-                agent_data = align_input_tensors(agent_data)
-                
-                
-                # Use the SINGLE shared advantage module on this specific agent's trajectory
-                advantage_modules[0](agent_data) 
-                
-                all_agents_data.append(agent_data)
+            with torch.no_grad():
+                tensordict_data["raw_global_state"]= build_global_state(tensordict_data["observation"], tensordict_data["mask"])
+                tensordict_data["next", "raw_global_state"] = build_global_state(tensordict_data["next", "observation"], tensordict_data["next", "mask"])
+            
+                for agent_num in range(NUM_AGENTS):
+                    agent_data = tensordict_data[agent_num]
+                    agent_data = agent_data.view(NUM_DESIRED_SEQUENCES, SEQUENCE_LENGTH)
+                    agent_data = align_input_tensors(agent_data)
+                    
+                    advantage_modules[0](agent_data) 
+                    all_agents_data.append(agent_data)
 
-            # 2. Combine the data (now populated with correct advantages)
             combined_data = torch.cat(all_agents_data, dim=0)
             total_sequences = NUM_AGENTS * NUM_DESIRED_SEQUENCES
             sequences_per_minibatch = (NUM_AGENTS * NUM_DESIRED_SEQUENCES) // NUM_MINI_BATCHES
 
         cur_loss_values = {}
-        # NUM_NETWORKS = 1 for MAPPO, NUM_AGENTS for IPPO.
-        for agent_num in range(NUM_NETWORKS):
+        for agent_num in range(NUM_AGENTS):
             if not USE_MAPPO:  # IPPO
                 agent_data = tensordict_data[agent_num]
 
-                replay_buffers[agent_num].extend(agent_data)
-
-                # As the done flags do not have the port dimension in the environment and torchrl
-                # requires value, reward, and done states to have the same shape, make sure this happens.
                 agent_data = align_input_tensors(agent_data)
+                with torch.no_grad():
+                    advantage_modules[agent_num](agent_data)
 
-                advantage_modules[agent_num](agent_data)
+                replay_buffers[agent_num].extend(agent_data)
 
             total_policy_loss = 0
             total_value_loss = 0
@@ -1228,7 +1226,6 @@ if not PERFORM_EVAL:
             update_steps = 0
 
             for epoch in range(NUM_EPOCHS):
-                # print(f"Agent {agent_num}", flush=True)
                 print(f"Agent: {agent_num}, Batch {i + BATCH_OFFSET}, epoch {epoch}", flush=True)
                 if USE_MAPPO:
                     perm = torch.randperm(total_sequences)
@@ -1236,23 +1233,16 @@ if not PERFORM_EVAL:
                     if USE_MAPPO:
                         batch_indices = perm[mini_batch_idx * sequences_per_minibatch : (mini_batch_idx + 1) * sequences_per_minibatch]
                         subdata = combined_data[batch_indices]  # Slice along sequence dimension so timesteps are still sequential.
-                        # print(f"Shape of subdata: {subdata['observation'].shape}")
                     else:
                         subdata = replay_buffers[agent_num].sample()
-                        # print(f"subdata shape: {subdata.shape}", flush=True)
                         subdata = align_input_tensors(subdata)
                         sequences_per_minibatch = NUM_DESIRED_SEQUENCES // NUM_MINI_BATCHES
-                    # print(f"batch_size: {tensordict_data[agent_num].shape}, subdata shape: {subdata.shape}, num_sequences: {NUM_DESIRED_SEQUENCES}, sl: {SEQUENCE_LENGTH}")
                         subdata = subdata.view(sequences_per_minibatch, SEQUENCE_LENGTH)
-                        # print(f'subdata shape: {subdata.shape}, {subdata["observation"].shape}')
 
-                    # print(f"Subdata after reshaping shape: {subdata.shape}")
-                    # ========== URGENT TODO: NEED TO CONCATENATE THE LOCAL STATES OF THE AGENTS AND FEED TO VALUE NETWORK
+                    
                     loss_vals = loss_modules[agent_num](subdata.to(device))
                     mask=subdata["mask"].squeeze(-1).to(device)  # N.B. this mask only matters when there is more than 1 switch and there are a different number of active ports between them.
 
-                    # print(f"loss_objective shape: {loss_vals['loss_objective'].shape}", flush=True)
-                    # print(f"mask shape {mask.shape}", flush=True)
                     masked_policy_loss = (loss_vals["loss_objective"] * mask).sum() / mask.sum()
                     masked_value_loss = (loss_vals["loss_critic"] * mask).sum() / mask.sum()
                     masked_entropy = (loss_vals["loss_entropy"] * mask).sum() / mask.sum()
@@ -1266,8 +1256,6 @@ if not PERFORM_EVAL:
                         target_rate = torch.tensor(FIRING_RATE, device=device)
 
                         rate_penalty = F.mse_loss(actual_rate, target_rate) 
-
-                        # print(f"RATE PENALTY: {rate_penalty}, other loss: {total_loss}")
                         total_loss += MSE_LOSS_SCALING * rate_penalty
 
                     if torch.isnan(total_loss):
@@ -1280,15 +1268,9 @@ if not PERFORM_EVAL:
 
                     total_loss.backward()
 
-                    # agent_num will always be 0 here when using MAPPO (as it iterates up to NUM_NETWORKS)
                     torch.nn.utils.clip_grad_norm_(loss_modules[agent_num].parameters(), max_grad_norm)
                     optims[agent_num].step()
                     optims[agent_num].zero_grad()
-
-                    for name, param in local_policies[agent_num].named_parameters():
-                        if torch.isnan(param).any():
-                            print(f"NaN weight in {name} at batch {batch_num}, epoch {epoch}, agent {agent_num}", flush=True)
-                            break
 
                     total_policy_loss += masked_policy_loss.item()
                     total_value_loss += masked_value_loss.item()
@@ -1296,11 +1278,6 @@ if not PERFORM_EVAL:
 
                     update_steps += 1
 
-                    # ADD THESE CHECKS
-                    
-                    # Optimization: backward, grad clipping and optimization step
-                    # loss_value.backward()
-            # log losses here.
             avg_policy_loss = total_policy_loss / update_steps
             avg_value_loss = total_value_loss / update_steps
             avg_entropy_loss = total_entropy_loss / update_steps
@@ -1309,19 +1286,14 @@ if not PERFORM_EVAL:
             replay_buffers[agent_num].empty()
             schedulers[agent_num].step()
         loss_values.append(cur_loss_values)
-
-        
-            # env.save_reward_history()
+        collector.update_policy_weights_()
            
         if USE_SNN:
             if INPUT_ENCODING == ENCODING.DIRECT:
                 snn_net = get_snn_net(local_policies[0])
                 actual_rate = snn_net.current_encoding_rate 
                 print("THE ACTUAL RATE IS: ", actual_rate)
-                # avg_firing_rates.append(FIRST_LAYER_SPIKING_AVERAGE)
                 avg_firing_rates.append(actual_rate.cpu().detach().item())
-
-                # Plotting the first agent's spiking rate for the first layer of direct encoding.
                 
             elif INPUT_ENCODING == ENCODING.DELTA:
                 snn_net = get_snn_net(local_policies[0])
@@ -1331,8 +1303,6 @@ if not PERFORM_EVAL:
                 snn_net = get_snn_net(local_policies[0])
                 firing_rate_hist = snn_net.rate_encoder.spike_rate_hist
                 avg_firing_rates = firing_rate_hist
-
-
 
         if batch_num % 10 == 0:
             fig, ax = plt.subplots()
@@ -1380,7 +1350,7 @@ if not PERFORM_EVAL:
                     colours = ['b', 'r', 'g', 'orange', 'purple', 'teal', 'gold']
                     fig, ax = plt.subplots()
                     for i in range(NUM_STATE_PARAMS):
-                        ax.plot([x[i].cpu() for x in avg_firing_rates], label=f"Firing Rate {i}", color=colours[i])
+                        ax.plot([x.cpu()[i] for x in avg_firing_rates], label=f"Firing Rate {i}", color=colours[i])
                     
                     ax.set_xlabel("Threshold Updates")
                     ax.set_ylabel("Firing Rate")
@@ -1402,7 +1372,7 @@ if not PERFORM_EVAL:
 
                     fig, ax = plt.subplots()
                     for i in range(NUM_STATE_PARAMS):
-                        ax.plot([x[i].cpu() for x in delta_modulation_thresholds[0]], label=f"Threshold {i}", color=colours[i])
+                        ax.plot([x[i] for x in delta_modulation_thresholds[0]], label=f"Threshold {i}", color=colours[i])
                     
                     ax.set_xlabel("Threshold Updates")
                     ax.set_ylabel("Threshold Value")
@@ -1427,20 +1397,27 @@ if not PERFORM_EVAL:
                         json.dump(rate_encoding_scaling_factors, f)
 
                     fig, ax = plt.subplots()
-                    ax2 = ax.twinx()
 
                     colours = ['b', 'r', 'g', 'orange', 'purple', 'teal', 'gold']
                     for i in range(NUM_STATE_PARAMS):
-                        ax.plot([x[i].cpu() for x in avg_firing_rates], label=f"Firing Rate {i}", color=colours[i])
-                    
-                    ax2.plot(rate_encoding_scaling_factors[0], label=f"Scaling Factor {i}", color='black')
+                        ax.plot([x.cpu()[i] for x in avg_firing_rates], label=f"Firing Rate {i}", color=colours[i])
                     
                     ax.set_xlabel("Scaling Factor Updates")
                     ax.set_ylabel("Firing Rate")
-                    ax2.set_ylabel("Scaling Factor")
                     fig.legend()
                     fig.tight_layout()
-                    fig.savefig(f'../firing_rates/{saved_models_suffix}_individual.png')
+                    fig.savefig(f'../firing_rates/{saved_models_suffix}_individual_rates.png')
+                    plt.close(fig)
+
+                    fig, ax = plt.subplots()
+                    for i in range(NUM_STATE_PARAMS):
+                        ax.plot([x[i] for x in rate_encoding_scaling_factors[0]], label=f"Scaling Factor {i}", color=colours[i])
+                    
+                    ax.set_xlabel("Scaling Factor Updates")
+                    ax.set_ylabel("Scaling Factor")
+                    fig.legend()
+                    fig.tight_layout()
+                    fig.savefig(f'../firing_rates/{saved_models_suffix}_individual_scaling_factors.png')
                     plt.close(fig)
 
                     fig, ax = plt.subplots()
@@ -1449,7 +1426,8 @@ if not PERFORM_EVAL:
                     ax.plot([sum(x.cpu()) / len(x.cpu()) for x in avg_firing_rates], label=f"Average Firing Rate", color='r')
                     
                     # Agent 0
-                    ax2.plot(rate_encoding_scaling_factors[0], label=f"Scaling Factor", color='b')
+                    for i in range(NUM_STATE_PARAMS):
+                        ax2.plot([x[i] for x in rate_encoding_scaling_factors[0]],label=f"Scaling Factor {i}", color='b')
                     
                     ax.set_xlabel("Scaling Factor Updates")
                     ax.set_ylabel("Firing Rate")
@@ -1471,22 +1449,23 @@ if not PERFORM_EVAL:
                 with open(f'../saved_models_{saved_models_suffix}/firing_rates.json', 'w') as f:
                     json.dump(avg_firing_rates, f)
 
-
-    # with open('../../trained_models_data.txt', 'w') as f:
-    #     for agent_num in range(NUM_AGENTS):
-    #         f.write(f"Agent {agent_num}:\n")
-    #         for batch_num, data in tracked_data[agent_num].items():
-    #             f.write(f"{batch_num},{data['mean_reward']},{data['mean_q_length']}\n")
 else:
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         print("RUNNING EVAL ROLLOUT", flush=True)
-        # env.start_ns3_simulation()  # This will stop the previous simulation and start a new one.
 
         if USE_SNN and INPUT_ENCODING == ENCODING.DIRECT:
             for agent_idx in range(NUM_AGENTS):
                 snn_net = get_snn_net(local_policies[agent_idx])
                 FIRST_LAYERS_SPIKING_AVERAGE = 0
                 FIRST_LAYERS_SPIKING_NUM_SAMPLES = 0
+        elif USE_SNN and INPUT_ENCODING == ENCODING.RATE:
+            for agent_idx in range(NUM_AGENTS):
+                snn_net = get_snn_net(local_policies[agent_idx])
+                snn_net.rate_encoder.reset_firing_averages()
+        elif USE_SNN and INPUT_ENCODING == ENCODING.DELTA:
+            for agent_idx in range(NUM_AGENTS):
+                snn_net = get_snn_net(local_policies[agent_idx])
+                snn_net.delta_modulator.reset_firing_averages()
 
         eval_rollout = env.rollout(10_000_000, multi_agent_policy_module) # Run until the simulation ends
         print("DONE ROLLOUT", flush=True)
@@ -1496,6 +1475,21 @@ else:
             for agent_idx in range(NUM_AGENTS):
                 snn_net = get_snn_net(local_policies[agent_idx])
                 print(f"Agent {agent_idx} Overall Eval Firing Rate: {snn_net.current_encoding_rate}")
+                print(f"avg: {FIRST_LAYERS_SPIKING_AVERAGE}, steps: {FIRST_LAYERS_SPIKING_NUM_SAMPLES}", flush=True)
+                fig, ax = plt.subplots()
+                ax.plot(snn_net.firing_rate_hist.cpu())
 
-
-            
+                fig.savefig("../eval_logs/0.85_firing_rate.png")
+                plt.close(fig)
+        elif USE_SNN and INPUT_ENCODING == ENCODING.RATE:
+            for agent_idx in range(NUM_AGENTS):
+                snn_net = get_snn_net(local_policies[agent_idx])
+                print(f"Num steps: {snn_net.step_count}, active_ports: {env.max_active_ports}", flush=True)
+                firing_avgs = snn_net.rate_encoder.get_current_firing_averages(env.max_active_ports, snn_net.step_count, debug=True)
+                print(f"Agent {agent_idx} Overall Eval Firing Rate: {firing_avgs}", flush=True)
+        elif USE_SNN and INPUT_ENCODING == ENCODING.DELTA:
+            for agent_idx in range(NUM_AGENTS):
+                snn_net = get_snn_net(local_policies[agent_idx])
+                print(f"Num steps: {snn_net.step_count}, active_ports: {env.max_active_ports}", flush=True)
+                firing_avgs = snn_net.delta_modulator.get_current_firing_averages(env.max_active_ports, snn_net.step_count, debug=True)
+                print(f"Agent {agent_idx} Overall Eval Firing Rate: {firing_avgs}", flush=True)
